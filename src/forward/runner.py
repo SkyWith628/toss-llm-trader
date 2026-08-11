@@ -111,7 +111,8 @@ def run_once(
 
     # --- 하루 결정·집행 ---
     signals = strategy.generate_signal(snapshot)
-    orders = signals_to_orders(signals, broker.get_portfolio(), prices, cfg.min_trade)
+    orders = signals_to_orders(signals, broker.get_portfolio(), prices,
+                               cfg.min_trade, slippage=cfg.slippage)
 
     fills = []
     for order in orders:

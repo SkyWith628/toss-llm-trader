@@ -4,6 +4,8 @@
 [Why]  전략은 '얼마나 갖고 싶은지'(비중)만 말하고, '얼마 사고팔지'(주문)는 여기서 계산 →
        전략과 집행의 관심사 분리.
 [How]  현재가치 대비 목표가치 차액을 주식수로 환산. 먼지 거래는 min_trade로 억제.
+       매수는 '가용 현금에 맞춰 클립' — 슬리피지 탓에 마지막 매수가 통째로 차단돼
+       예산 절반이 놀던 문제를 없앤다(차단 대신 살 수 있는 만큼).
 """
 from __future__ import annotations
 
@@ -15,11 +17,14 @@ def signals_to_orders(
     portfolio: Portfolio,
     prices: dict[str, float],
     min_trade: float = 1.0,
+    slippage: float = 0.0005,
 ) -> list[Order]:
     total = portfolio.total_value(prices)
     targets = {s.symbol: max(0.0, s.target_weight) for s in signals}
     reasons = {s.symbol: s.rationale for s in signals}
-    orders: list[Order] = []
+
+    sells: list[Order] = []
+    buys: list[tuple[str, float, float]] = []   # (symbol, qty, price) — 삽입 순서 유지
 
     for symbol, weight in targets.items():
         price = prices.get(symbol)
@@ -33,9 +38,28 @@ def signals_to_orders(
         if abs(diff_value) < min_trade:
             continue
         qty = abs(diff_value) / price
-        side = Side.BUY if diff_value > 0 else Side.SELL
-        orders.append(Order(symbol, side, qty, reasons.get(symbol, "")))
+        if diff_value > 0:
+            buys.append((symbol, qty, price))
+        else:
+            sells.append(Order(symbol, Side.SELL, qty, reasons.get(symbol, "")))
 
     # 매도를 먼저 실행해 현금을 확보한 뒤 매수(현금 부족 방지)
-    orders.sort(key=lambda o: 0 if o.side is Side.SELL else 1)
+    orders: list[Order] = list(sells)
+
+    # 가용 현금 = 현재 현금 + 매도 예상 대금(슬리피지 반영). 매수는 이 한도 안에서만.
+    avail = portfolio.cash + sum(
+        o.quantity * prices[o.symbol] * (1 - slippage) for o in sells)
+
+    for symbol, qty, price in buys:
+        # 이 매수에 실제로 드는 현금(슬리피지 포함). 남은 현금을 넘으면 살 수 있는 만큼으로 축소.
+        needed = qty * price * (1 + slippage)
+        if needed > avail:
+            qty = (avail / (1 + slippage)) / price if avail > 0 else 0.0
+        if qty * price < min_trade:   # 클립 후 먼지 거래면 건너뜀
+            continue
+        orders.append(Order(symbol, Side.BUY, qty, reasons.get(symbol, "")))
+        avail -= qty * price * (1 + slippage)
+        if avail < min_trade:         # 남은 현금이 먼지면 이후 매수 중단
+            break
+
     return orders
