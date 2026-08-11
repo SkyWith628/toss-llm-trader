@@ -164,6 +164,18 @@ def test_fallback_does_not_pollute_memory():
     assert len(strat.memory) == 0
 
 
+# --- 프롬프트 캐싱 ---
+
+def test_system_prompt_has_cache_breakpoint():
+    """system 블록에 cache_control이 붙어 고정부(tools+system)가 캐시되어야 한다."""
+    decision = {"market_view": "", "positions": []}
+    fake = _FakeMessages(decision)
+    LLMAgentStrategy(client=SimpleNamespace(messages=fake)).generate_signal(_snapshot())
+    system = fake.calls[0]["system"]
+    assert isinstance(system, list)
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

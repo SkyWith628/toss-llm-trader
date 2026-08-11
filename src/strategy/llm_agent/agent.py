@@ -64,7 +64,13 @@ class LLMAgentStrategy(Strategy):
             resp = self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
-                system=SYSTEM_PROMPT,
+                # system 블록에 캐시 브레이크포인트 → 렌더 순서상 tools+system(고정부)이
+                # 통째로 캐시된다. 매일 바뀌는 user 메시지는 캐시 밖(의도된 분리).
+                system=[{
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 messages=[{"role": "user", "content": user_msg}],
                 tools=[DECISION_TOOL],
                 tool_choice={"type": "tool", "name": TOOL_NAME},
@@ -112,6 +118,11 @@ class LLMAgentStrategy(Strategy):
         return {
             "input_tokens": getattr(usage, "input_tokens", None),
             "output_tokens": getattr(usage, "output_tokens", None),
+            # 캐시 검증용: read가 0 이상이면 고정부가 캐시에서 재사용된 것.
+            "cache_creation_input_tokens": getattr(
+                usage, "cache_creation_input_tokens", None),
+            "cache_read_input_tokens": getattr(
+                usage, "cache_read_input_tokens", None),
         }
 
     def _log(self, record: dict) -> None:
