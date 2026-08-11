@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 
-from src.core.types import Action, Signal
+from src.core.types import Action, Side, Signal
 from src.data.storage import PriceStore
 from src.execution.paper_broker import PaperBroker
 from src.execution.rebalance import signals_to_orders
@@ -101,10 +101,11 @@ def run_once(
     prices = store.prices_on(date)
     snapshot = store.snapshot(date, lookback=cfg.lookback + 5)
 
-    # 페이퍼 계좌를 상태에서 복원(이 파일이 곧 계좌)
-    broker = PaperBroker(starting_cash=state.cash, slippage=cfg.slippage,
+    exp = state.experiment   # 실험 장부(단일 모델). 페이퍼는 protected_positions={}.
+    # 페이퍼 브로커는 '체결 시뮬레이터' — 실험 장부는 실제 체결값으로 갱신한다(apply_buy/sell).
+    broker = PaperBroker(starting_cash=exp.cash, slippage=cfg.slippage,
                          min_notional=cfg.min_trade)
-    broker.portfolio = state.to_portfolio()
+    broker.portfolio = exp.to_portfolio()
     broker.set_prices(prices)
 
     guardrail = Guardrail(budget=cfg.budget, valid_symbols=set(cfg.symbols))
@@ -125,22 +126,27 @@ def run_once(
                           "status": "blocked", "reason": decision.reason})
             continue
         result = broker.place_order(decision.order, when=date)
+        if result.status == "filled":   # 실체결 기반 장부 갱신(손익·수수료 추적)
+            if order.side is Side.BUY:
+                exp.apply_buy(order.symbol, result.filled_qty,
+                              result.fill_price, result.commission)
+            else:
+                exp.apply_sell(order.symbol, result.filled_qty,
+                               result.fill_price, result.commission)
         fills.append({"symbol": order.symbol, "side": order.side.value,
                       "qty": round(order.quantity, 6), "status": result.status,
                       "fill": result.fill_price, "commission": result.commission,
                       "reason": order.reason})
 
-    # --- 2) 측정: 오늘 종가로 전략 NAV vs Buy&Hold(첫 실행에 앵커 고정) ---
+    # --- 2) 측정: 오늘 종가로 실험 NAV vs Buy&Hold(첫 실행에 앵커 고정) ---
     state.ensure_bh_anchor(prices)
-    pf = broker.get_portfolio()
-    strat_value = pf.total_value(prices)
+    strat_value = exp.nav(prices)
     bh_value = state.bh_value(prices)
 
     # --- 3) 오늘 결정 생성 → '다음' 실행에 체결하도록 영속(오늘 정보만으로 결정) ---
     decided = strategy.generate_signal(snapshot)
 
     # --- 4) 상태 갱신·영속화 ---
-    state.update_from_portfolio(pf)
     if hasattr(strategy, "memory"):
         state.memory = strategy.memory.to_list()  # 회고 연속성 저장
     state.pending_signals = _signals_to_dicts(decided)   # 다음 실행이 이걸 체결
@@ -153,8 +159,12 @@ def run_once(
     row = {
         "date": date_iso, "day": state.day_count,
         "strategy_value": round(strat_value, 4), "bh_value": round(bh_value, 4),
-        "cash": round(pf.cash, 4),
-        "positions": {s: round(p.quantity, 6) for s, p in pf.positions.items()},
+        "cash": round(exp.cash, 4), "realized_pnl": round(exp.realized_pnl, 4),
+        "fees_paid": round(exp.fees_paid, 4), "status": exp.status,
+        # 귀속 구분: 실험 보유 vs 보호 기준선(페이퍼는 protected={}; 실계좌 연결 시 채워짐).
+        "experiment_positions": {s: round(ep.quantity, 6)
+                                 for s, ep in exp.experiment_positions.items()},
+        "protected_positions": exp.protected_positions,
         "executed_fills": fills,   # 직전 결정의 '오늘' 체결
         "decided_signals": [{"symbol": s.symbol, "action": s.action.value,
                              "weight": round(s.target_weight, 4), "why": s.rationale}
@@ -167,8 +177,8 @@ def run_once(
         "strategy_value": round(strat_value, 4), "bh_value": round(bh_value, 4),
         "strategy_return": round(strat_value / cfg.budget - 1.0, 4),
         "bh_return": round(bh_value / cfg.budget - 1.0, 4),
-        "cash": round(pf.cash, 4), "commission": round(broker.total_commission_paid, 6),
-        "fills": fills,
+        "cash": round(exp.cash, 4), "realized_pnl": round(exp.realized_pnl, 4),
+        "commission": round(broker.total_commission_paid, 6), "fills": fills,
     }
 
 

@@ -1,19 +1,20 @@
 """Forward 실험의 영속 상태 — '매일 별도 프로세스'를 이어붙이는 접착제.
 
-[What] 페이퍼 계좌(현금·보유) · 회고 메모리 · Buy&Hold 앵커 · 실험 메타를 JSON 1파일로
-       저장/복원한다. 이 파일이 곧 페이퍼 계좌다(Toss 라우팅 없이 로컬 시뮬레이션).
+[What] 실험 장부(ExperimentPortfolio: 실험/보호 포지션·현금·손익·상태) · 회고 메모리 ·
+       Buy&Hold 앵커 · 직전 결정(pending) · 실험 메타를 JSON 1파일로 저장/복원한다.
 [Why]  forward는 하루 1회 실행이라 프로세스 메모리가 매번 사라진다. 연속성(직전 결정
        회고·누적 손익·동일 앵커의 B&H)을 파일로 실어 날라야 공정 측정이 된다.
-[How]  로드-또는-초기화. 첫 실행에서 예산 전액 현금 + 그날 가격으로 B&H 주식수를 '한 번'
-       고정(이후 불변) → 전략과 동일 구간·동일 시작점 비교.
+[How]  실험 장부를 단일 모델(ExperimentPortfolio)로 통일 — 페이퍼는 protected_positions={}
+       인 특수경우, 실계좌는 기존 보유를 보호분으로. 이후 CarveOutBroker가 같은 장부를 쓴다.
 """
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
-from src.core.types import Portfolio, Position
+from src.core.types import Portfolio
+from src.forward.experiment_portfolio import ExperimentPortfolio
 
 
 @dataclass
@@ -28,8 +29,7 @@ class ForwardState:
     started_at: str = ""            # 첫 실행 거래일(ISO date)
     last_run_date: str = ""         # 마지막으로 매매한 거래일(중복 실행 방지)
     day_count: int = 0              # 매매한 거래일 수
-    cash: float = 0.0
-    positions: dict[str, dict] = field(default_factory=dict)   # sym -> {quantity, avg_price}
+    experiment: ExperimentPortfolio | None = None   # 실험 장부(단일 모델)
     bh_shares: dict[str, float] = field(default_factory=dict)  # B&H 주식수(앵커, 불변)
     bh_anchor: dict[str, float] = field(default_factory=dict)  # 앵커 시점 가격(기록용)
     memory: list[dict] = field(default_factory=list)           # DecisionMemory 덤프
@@ -51,35 +51,47 @@ class ForwardState:
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            st = cls(**data)
+            exp = ExperimentPortfolio.from_dict(data["experiment"])
+            st = cls(
+                budget=data["budget"], symbols=list(data["symbols"]),
+                source=data["source"], strategy=data["strategy"], model=data["model"],
+                started_at=data.get("started_at", ""),
+                last_run_date=data.get("last_run_date", ""),
+                day_count=data.get("day_count", 0), experiment=exp,
+                bh_shares=dict(data.get("bh_shares") or {}),
+                bh_anchor=dict(data.get("bh_anchor") or {}),
+                memory=list(data.get("memory") or []),
+                pending_signals=list(data.get("pending_signals") or []))
             if abs(st.budget - budget) > 1e-9 or sorted(st.symbols) != sorted(symbols):
                 raise ValueError(
                     f"기존 실험과 구성이 다릅니다(budget/symbols). "
                     f"새 실험은 다른 --state-dir을 쓰세요. 기존={st.symbols}@${st.budget}")
             return st
+        # 신규: 페이퍼는 보호분 없음(protected_positions={}), 예산 전액이 실험 현금.
+        exp = ExperimentPortfolio(initial_capital=budget, cash=budget)
         return cls(budget=budget, symbols=list(symbols), source=source,
-                   strategy=strategy, model=model, cash=budget)
+                   strategy=strategy, model=model, experiment=exp)
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "budget": self.budget, "symbols": self.symbols, "source": self.source,
+            "strategy": self.strategy, "model": self.model,
+            "started_at": self.started_at, "last_run_date": self.last_run_date,
+            "day_count": self.day_count,
+            "experiment": self.experiment.to_dict() if self.experiment else None,
+            "bh_shares": self.bh_shares, "bh_anchor": self.bh_anchor,
+            "memory": self.memory, "pending_signals": self.pending_signals,
+        }
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(asdict(self), f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)  # 원자적 교체 — 쓰다 죽어도 상태 파일이 깨지지 않게
 
-    # ---------- Portfolio <-> state 브리지 ----------
+    # ---------- 편의 ----------
     def to_portfolio(self) -> Portfolio:
-        pf = Portfolio(cash=self.cash)
-        for sym, p in self.positions.items():
-            pf.positions[sym] = Position(sym, p["quantity"], p["avg_price"])
-        return pf
-
-    def update_from_portfolio(self, pf: Portfolio) -> None:
-        self.cash = round(pf.cash, 6)
-        self.positions = {
-            sym: {"quantity": round(pos.quantity, 8), "avg_price": round(pos.avg_price, 6)}
-            for sym, pos in pf.positions.items()
-        }
+        """실험 슬라이스를 표준 Portfolio로(보호분 제외) — 리밸런서·가드레일 재사용용."""
+        return self.experiment.to_portfolio()
 
     # ---------- Buy&Hold 앵커(첫 실행에 한 번 고정) ----------
     def ensure_bh_anchor(self, prices: dict[str, float]) -> None:

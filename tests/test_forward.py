@@ -31,6 +31,21 @@ class FixedStrategy(Strategy):
                 for s, w in self.weights.items()]
 
 
+class ScriptedStrategy(Strategy):
+    """날짜별로 정해진 목표비중을 순서대로 내는 mock 전략(체결→장부 갱신 검증용)."""
+    name = "scripted"
+
+    def __init__(self, weights_by_day: list[dict[str, float]]) -> None:
+        self.weights_by_day = weights_by_day
+        self.i = 0
+
+    def generate_signal(self, snapshot: MarketSnapshot) -> list[Signal]:
+        w = self.weights_by_day[min(self.i, len(self.weights_by_day) - 1)]
+        self.i += 1
+        return [Signal(s, Action.BUY if v > 0 else Action.SELL, v,
+                       timestamp=snapshot.timestamp) for s, v in w.items()]
+
+
 def _cfg(state_dir: str) -> ForwardConfig:
     return ForwardConfig(symbols=["AAA", "BBB"], budget=100.0, source="synthetic",
                          strategy="momentum", state_dir=state_dir, min_trade=1.0)
@@ -62,7 +77,8 @@ def test_state_roundtrip_and_bh_anchor():
         st2 = ForwardState.load_or_init(path, budget=100.0, symbols=["AAA", "BBB"],
                                         source="synthetic", strategy="momentum", model="-")
         assert st2.bh_shares == anchor          # 앵커가 파일 왕복 후에도 동일
-        assert abs(st2.cash - 100.0) < 1e-9     # 초기 전액 현금
+        assert abs(st2.experiment.cash - 100.0) < 1e-9   # 초기 전액 현금(실험 장부)
+        assert st2.experiment.protected_positions == {}  # 페이퍼는 보호분 없음
         # 앵커 시점 B&H 총가치 ≈ 예산(슬리피지만큼만 손실)
         assert st2.bh_value({"AAA": 100.0, "BBB": 50.0}) < 100.0
 
@@ -78,20 +94,36 @@ def test_two_day_continuity_next_bar():
         assert not r1["skipped"] and r1["day"] == 1 and r1["fills"] == []   # 첫날 무체결
         st1 = ForwardState.load_or_init(cfg.state_path, budget=100.0, symbols=cfg.symbols,
                                         source="synthetic", strategy="momentum", model="-")
-        assert "AAA" not in st1.positions        # 당일 종가 신호를 당일 체결하지 않음
+        assert "AAA" not in st1.experiment.experiment_positions  # 당일 종가 신호를 당일 체결 안 함
         assert st1.pending_signals               # 첫날 결정은 pending으로 저장(다음날 체결)
 
         r2 = run_once(cfg, store=store, today=store.dates[11], strategy=strat)
         assert not r2["skipped"] and r2["day"] == 2 and r2["fills"]         # 둘째날 체결 발생
         st2 = ForwardState.load_or_init(cfg.state_path, budget=100.0, symbols=cfg.symbols,
                                         source="synthetic", strategy="momentum", model="-")
-        assert "AAA" in st2.positions            # 어제 결정이 오늘 체결됨
+        assert "AAA" in st2.experiment.experiment_positions   # 어제 결정이 오늘 체결됨
         # 체결가는 '둘째날' 종가여야(첫날 종가 아님) — next-bar 집행 확인
         assert abs(r2["fills"][0]["fill"] - store.prices_on(store.dates[11])["AAA"]) \
             < store.prices_on(store.dates[11])["AAA"] * 0.01
         with open(cfg.equity_path, encoding="utf-8") as f:
             lines = [ln for ln in f if ln.strip()]
         assert len(lines) == 2
+
+
+def test_runner_tracks_realized_pnl_via_ledger():
+    """실체결로 실험 장부가 갱신되는지 — 매수 후 전량 매도 시 realized_pnl이 잡혀야."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d)
+        store = make_synthetic_store(cfg.symbols, days=30, seed=13)
+        # day1 결정: AAA 100% / day2 결정: 청산 / day3: 청산 유지
+        strat = ScriptedStrategy([{"AAA": 1.0}, {"AAA": 0.0}, {"AAA": 0.0}])
+        for i in (10, 11, 12):   # day1 결정→day2 매수→day3 매도
+            run_once(cfg, store=store, today=store.dates[i], strategy=strat)
+        st = ForwardState.load_or_init(cfg.state_path, budget=100.0, symbols=cfg.symbols,
+                                       source="synthetic", strategy="momentum", model="-")
+        assert "AAA" not in st.experiment.experiment_positions   # 전량 매도됨
+        assert st.experiment.realized_pnl != 0.0                 # 손익이 장부에 기록됨
+        assert st.experiment.status == "active"                  # 대사 위반 없음
 
 
 def test_same_day_rerun_skipped():
