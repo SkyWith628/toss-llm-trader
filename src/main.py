@@ -102,15 +102,16 @@ def run(args: argparse.Namespace) -> dict:
         dates = dates[-args.days:]
 
     # 3) 하루씩 전진(점진적 관찰 — 미래 미포함)
+    #    시점누수 방지: '오늘 종가'로 결정하고 '오늘 종가'에 체결하면 실현 불가능하다.
+    #    그래서 직전 거래일의 결정(pending)을 오늘 가격에 체결한다(next-bar 집행).
+    pending_signals: list = []
     for date in dates:
         clock.set_time(date)
         prices = store.prices_on(date)
         broker.set_prices(prices)
-        snapshot = store.snapshot(date, lookback=args.lookback + 5)
 
-        signals = strategy.generate_signal(snapshot)
-        orders = signals_to_orders(signals, broker.get_portfolio(), prices)
-
+        # 3-1) 직전 결정을 오늘 체결(첫날은 pending 없음 → 전량 현금)
+        orders = signals_to_orders(pending_signals, broker.get_portfolio(), prices)
         fills = []
         for order in orders:
             decision = guardrail.check(order, broker.get_portfolio(), prices)
@@ -124,19 +125,25 @@ def run(args: argparse.Namespace) -> dict:
                           "status": result.status, "fill": result.fill_price,
                           "commission": result.commission, "reason": order.reason})
 
+        # 3-2) 오늘 종가로 자산 마킹
         pf = broker.get_portfolio()
         total = pf.total_value(prices)
         equity_curve.append(total)
+
+        # 3-3) 오늘 결정(다음 거래일에 체결) — 오늘 정보만으로 생성
+        snapshot = store.snapshot(date, lookback=args.lookback + 5)
+        signals = strategy.generate_signal(snapshot)
+        pending_signals = signals
 
         ledger.record_day({
             "date": date.date().isoformat(),
             "total_value": round(total, 4),
             "cash": round(pf.cash, 4),
             "positions": {s: round(p.quantity, 6) for s, p in pf.positions.items()},
-            "signals": [{"symbol": s.symbol, "action": s.action.value,
-                         "weight": round(s.target_weight, 4), "why": s.rationale}
-                        for s in signals],
-            "fills": fills,
+            "decided_signals": [{"symbol": s.symbol, "action": s.action.value,
+                                 "weight": round(s.target_weight, 4), "why": s.rationale}
+                                for s in signals],
+            "executed_fills": fills,
         })
 
     # 4) 대조군 + 지표 (전략과 '같은 창'에서 측정해야 공정 비교)

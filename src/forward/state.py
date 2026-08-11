@@ -33,6 +33,9 @@ class ForwardState:
     bh_shares: dict[str, float] = field(default_factory=dict)  # B&H 주식수(앵커, 불변)
     bh_anchor: dict[str, float] = field(default_factory=dict)  # 앵커 시점 가격(기록용)
     memory: list[dict] = field(default_factory=list)           # DecisionMemory 덤프
+    # 직전 거래일에 내린 결정 — '오늘' 체결한다(시점누수 방지: 당일종가 신호를 당일 체결하지 않음).
+    # 각 항목: {"symbol","action","target_weight","rationale"}
+    pending_signals: list[dict] = field(default_factory=list)
 
     # ---------- 로드/초기화/저장 ----------
     @classmethod

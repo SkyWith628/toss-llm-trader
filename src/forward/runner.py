@@ -14,6 +14,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 
+from src.core.types import Action, Signal
 from src.data.storage import PriceStore
 from src.execution.paper_broker import PaperBroker
 from src.execution.rebalance import signals_to_orders
@@ -109,9 +110,11 @@ def run_once(
     guardrail = Guardrail(budget=cfg.budget, valid_symbols=set(cfg.symbols))
     strategy = strategy or _build_strategy(cfg, state)
 
-    # --- 하루 결정·집행 ---
-    signals = strategy.generate_signal(snapshot)
-    orders = signals_to_orders(signals, broker.get_portfolio(), prices,
+    # --- 1) 직전 거래일의 결정(pending)을 '오늘' 체결 (시점누수 방지) ---
+    # 당일 종가로 결정하고 당일 종가에 체결하는 건 실현 불가능한 가정이다. 그래서 어제 내린
+    # 결정을 오늘 가격에 집행한다. 첫 실행엔 pending이 없어 매매가 없다(전량 현금).
+    pending = _signals_from_dicts(state.pending_signals, date)
+    orders = signals_to_orders(pending, broker.get_portfolio(), prices,
                                cfg.min_trade, slippage=cfg.slippage)
 
     fills = []
@@ -127,16 +130,20 @@ def run_once(
                       "fill": result.fill_price, "commission": result.commission,
                       "reason": order.reason})
 
-    # --- 측정: 전략 vs Buy&Hold(첫 실행에 앵커 고정) ---
+    # --- 2) 측정: 오늘 종가로 전략 NAV vs Buy&Hold(첫 실행에 앵커 고정) ---
     state.ensure_bh_anchor(prices)
     pf = broker.get_portfolio()
     strat_value = pf.total_value(prices)
     bh_value = state.bh_value(prices)
 
-    # --- 상태 갱신·영속화 ---
+    # --- 3) 오늘 결정 생성 → '다음' 실행에 체결하도록 영속(오늘 정보만으로 결정) ---
+    decided = strategy.generate_signal(snapshot)
+
+    # --- 4) 상태 갱신·영속화 ---
     state.update_from_portfolio(pf)
     if hasattr(strategy, "memory"):
         state.memory = strategy.memory.to_list()  # 회고 연속성 저장
+    state.pending_signals = _signals_to_dicts(decided)   # 다음 실행이 이걸 체결
     if not state.started_at:
         state.started_at = date_iso
     state.last_run_date = date_iso
@@ -148,10 +155,10 @@ def run_once(
         "strategy_value": round(strat_value, 4), "bh_value": round(bh_value, 4),
         "cash": round(pf.cash, 4),
         "positions": {s: round(p.quantity, 6) for s, p in pf.positions.items()},
-        "signals": [{"symbol": s.symbol, "action": s.action.value,
-                     "weight": round(s.target_weight, 4), "why": s.rationale}
-                    for s in signals],
-        "fills": fills,
+        "executed_fills": fills,   # 직전 결정의 '오늘' 체결
+        "decided_signals": [{"symbol": s.symbol, "action": s.action.value,
+                             "weight": round(s.target_weight, 4), "why": s.rationale}
+                            for s in decided],  # 오늘 결정(다음 실행에 체결)
     }
     _append_jsonl(cfg.equity_path, row)
 
@@ -183,6 +190,26 @@ def build_report(cfg: ForwardConfig) -> dict:
         "strategy": {"name": cfg.strategy, **compute_metrics(strat_eq)},
         "buy_and_hold": {"name": "buy_and_hold", **compute_metrics(bh_eq)},
     }
+
+
+def _signals_to_dicts(signals: list[Signal]) -> list[dict]:
+    """결정을 state.json에 실어 나르기 위한 직렬화(다음 거래일 체결용)."""
+    return [{"symbol": s.symbol, "action": s.action.value,
+             "target_weight": s.target_weight, "rationale": s.rationale}
+            for s in signals]
+
+
+def _signals_from_dicts(items: list[dict], timestamp) -> list[Signal]:
+    """직전 결정 복원 — 오늘 가격에 체결한다. 리밸런서가 쓰는 필드만 채우면 충분."""
+    out = []
+    for it in items or []:
+        out.append(Signal(
+            symbol=it["symbol"],
+            action=Action(it.get("action", "hold")),
+            target_weight=float(it.get("target_weight", 0.0)),
+            timestamp=timestamp,
+            rationale=it.get("rationale", "")))
+    return out
 
 
 def _append_jsonl(path: str, row: dict) -> None:

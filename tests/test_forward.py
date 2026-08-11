@@ -67,22 +67,28 @@ def test_state_roundtrip_and_bh_anchor():
         assert st2.bh_value({"AAA": 100.0, "BBB": 50.0}) < 100.0
 
 
-def test_two_day_continuity():
-    """이틀 연속 실행 시 포지션·회차가 상태로 이어져야(각 날은 별도 run_once 호출)."""
+def test_two_day_continuity_next_bar():
+    """시점누수 방지: 첫날은 체결 없음(직전 결정 없음), 둘째날에 '어제 결정'이 체결돼야."""
     with tempfile.TemporaryDirectory() as d:
         cfg = _cfg(d)
         store = make_synthetic_store(cfg.symbols, days=30, seed=3)
         strat = FixedStrategy({"AAA": 0.5})
 
         r1 = run_once(cfg, store=store, today=store.dates[10], strategy=strat)
-        assert not r1["skipped"] and r1["day"] == 1
+        assert not r1["skipped"] and r1["day"] == 1 and r1["fills"] == []   # 첫날 무체결
         st1 = ForwardState.load_or_init(cfg.state_path, budget=100.0, symbols=cfg.symbols,
                                         source="synthetic", strategy="momentum", model="-")
-        assert "AAA" in st1.positions            # 첫날 매수분이 파일에 저장됨
+        assert "AAA" not in st1.positions        # 당일 종가 신호를 당일 체결하지 않음
+        assert st1.pending_signals               # 첫날 결정은 pending으로 저장(다음날 체결)
 
         r2 = run_once(cfg, store=store, today=store.dates[11], strategy=strat)
-        assert not r2["skipped"] and r2["day"] == 2
-        # equity.jsonl에 이틀치 누적
+        assert not r2["skipped"] and r2["day"] == 2 and r2["fills"]         # 둘째날 체결 발생
+        st2 = ForwardState.load_or_init(cfg.state_path, budget=100.0, symbols=cfg.symbols,
+                                        source="synthetic", strategy="momentum", model="-")
+        assert "AAA" in st2.positions            # 어제 결정이 오늘 체결됨
+        # 체결가는 '둘째날' 종가여야(첫날 종가 아님) — next-bar 집행 확인
+        assert abs(r2["fills"][0]["fill"] - store.prices_on(store.dates[11])["AAA"]) \
+            < store.prices_on(store.dates[11])["AAA"] * 0.01
         with open(cfg.equity_path, encoding="utf-8") as f:
             lines = [ln for ln in f if ln.strip()]
         assert len(lines) == 2
