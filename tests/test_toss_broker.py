@@ -22,7 +22,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.types import Order, Side
-from src.execution.toss_broker import TossBroker
+from src.execution.toss_broker import TossBroker, _decode_body, _err_msg
 
 
 class FakeToss:
@@ -43,6 +43,9 @@ class FakeToss:
             self.token_issued += 1
             return 200, {"access_token": f"tok-{self.token_issued}",
                          "token_type": "Bearer", "expires_in": 3600}
+        if path == "/api/v1/accounts":
+            return 200, {"result": [{"accountSeq": "acc-77", "accountName": "종합위탁",
+                                     "status": "NORMAL"}]}
         if path == "/api/v1/prices":
             return 200, {"result": [{"symbol": "AAPL", "lastPrice": str(self.price),
                                      "currency": "USD"}]}
@@ -75,6 +78,16 @@ def test_token_is_cached():
     b = _broker(fake, live=False)
     b.get_prices(); b.get_prices()
     assert fake.token_issued == 1  # 두 번 조회해도 토큰은 1회 발급(캐싱)
+
+
+def test_list_accounts_returns_account_seq():
+    """계좌 탐색은 accountSeq(=X-Tossinvest-Account/TOSS_ACCOUNT_NO)를 돌려줘야."""
+    fake = FakeToss()
+    b = _broker(fake, live=False)
+    accounts = b.list_accounts()
+    assert accounts and accounts[0]["accountSeq"] == "acc-77"
+    # 진입점이라 계좌 헤더 없이 조회(GET /api/v1/accounts 1회)
+    assert ("GET", "/api/v1/accounts") in fake.calls
 
 
 def test_prices_batched_in_one_call():
@@ -145,6 +158,23 @@ def test_get_order_parses_execution():
     r = b.get_order("ord-1")
     assert r.status == "filled"
     assert r.filled_qty == 1.0 and r.fill_price == 20.0 and r.commission == 0.01
+
+
+def test_decode_body_handles_gzip():
+    """서버가 gzip으로 준 본문도 해제돼야(에러가 바이너리로 깨지지 않게)."""
+    import gzip
+    payload = b'{"error":"access_denied","error_description":"IP address not allowed"}'
+    assert _decode_body(gzip.compress(payload), "gzip") == payload.decode()
+    assert _decode_body(payload, "") == payload.decode()  # 무압축도 그대로
+
+
+def test_err_msg_prefers_readable_fields():
+    """OAuth2 에러(error_description)와 일반 API 에러(message)를 모두 사람이 읽게 뽑아야."""
+    assert _err_msg({"error": "access_denied",
+                     "error_description": "IP address not allowed"}, "x") \
+        == "IP address not allowed"
+    assert _err_msg({"message": "잔고 부족"}, "x") == "잔고 부족"
+    assert _err_msg({}, "폴백") == "폴백"
 
 
 def test_missing_credentials_raises():

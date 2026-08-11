@@ -20,12 +20,14 @@
 """
 from __future__ import annotations
 
+import gzip
 import json
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from datetime import datetime
 from typing import Callable
 
@@ -51,6 +53,25 @@ class TossApiError(RuntimeError):
         self.status = status
 
 
+def _decode_body(raw: bytes, encoding: str) -> str:
+    """응답 본문을 텍스트로. 서버가 gzip/deflate로 보내도 해제(에러 본문이 깨지지 않게)."""
+    enc = (encoding or "").lower()
+    if enc == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    elif enc == "deflate":
+        try:
+            raw = zlib.decompress(raw)
+        except Exception:
+            try:
+                raw = zlib.decompress(raw, -zlib.MAX_WBITS)  # raw deflate
+            except Exception:
+                pass
+    return raw.decode("utf-8", "replace")
+
+
 def _urllib_transport(
     method: str, url: str, headers: dict[str, str], body: bytes | None
 ) -> tuple[int, dict]:
@@ -58,14 +79,14 @@ def _urllib_transport(
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8") or "{}"
-            return resp.status, json.loads(raw)
+            text = _decode_body(resp.read(), resp.headers.get("Content-Encoding", "")) or "{}"
+            return resp.status, json.loads(text)
     except urllib.error.HTTPError as e:  # 4xx/5xx
-        raw = e.read().decode("utf-8", "replace") or "{}"
+        text = _decode_body(e.read(), e.headers.get("Content-Encoding", "")) or "{}"
         try:
-            return e.code, json.loads(raw)
+            return e.code, json.loads(text)
         except json.JSONDecodeError:
-            return e.code, {"message": raw[:200]}
+            return e.code, {"message": text[:200]}
 
 
 def _f(x, default: float = 0.0) -> float:
@@ -73,6 +94,18 @@ def _f(x, default: float = 0.0) -> float:
     if x is None or x == "":
         return default
     return float(x)
+
+
+def _err_msg(data: dict, fallback: str) -> str:
+    """에러 응답에서 사람이 읽을 메시지를 뽑는다(엔드포인트마다 필드가 다름).
+
+    OAuth2는 error_description/error, 일반 API는 message를 쓴다. 시크릿은 담기지 않는다.
+    """
+    for k in ("message", "error_description", "error"):
+        v = data.get(k)
+        if v:
+            return str(v)
+    return fallback
 
 
 def _num(x: float) -> str:
@@ -139,7 +172,7 @@ class TossBroker(BrokerClient):
         status, data = self._transport(
             "POST", f"{self.base_url}/oauth2/token", headers, body)
         if status != 200 or "access_token" not in data:
-            raise TossApiError(status, data.get("message", "토큰 발급 실패"))
+            raise TossApiError(status, _err_msg(data, "토큰 발급 실패"))
 
         self._token = data["access_token"]
         # 만료 60초 전에 갱신(네트워크 지연 여유). expires_in 없으면 보수적으로 5분.
@@ -158,8 +191,22 @@ class TossBroker(BrokerClient):
         status, data = self._transport("GET", f"{self.base_url}{path}",
                                        self._headers(with_account=account), None)
         if status != 200:
-            raise TossApiError(status, data.get("message", f"GET {path} 실패"))
+            raise TossApiError(status, _err_msg(data, f"GET {path} 실패"))
         return data.get("result", data)  # ApiResponse 봉투에서 result 추출
+
+    # ================= 계좌 탐색(진입점) =================
+    def list_accounts(self) -> list[dict]:
+        """계좌 목록 조회 — accountSeq(=X-Tossinvest-Account 헤더값)를 얻는 진입점.
+
+        [What] GET /api/v1/accounts. 정상 상태 계좌만, 없으면 빈 배열.
+        [Why]  다른 계좌 API는 X-Tossinvest-Account 헤더에 accountSeq를 요구하는데,
+               그 값의 출처가 바로 이 엔드포인트다(사용자가 손으로 찾을 필요 없음).
+        [How]  자기 자신이 목록 조회라 계좌 헤더가 필요 없다(Bearer 토큰만).
+        """
+        result = self._get("/api/v1/accounts")
+        if isinstance(result, list):
+            return result
+        return result.get("items", []) or []
 
     # ================= BrokerClient 계약 =================
     def get_prices(self) -> dict[str, float]:
