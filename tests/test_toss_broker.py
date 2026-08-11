@@ -152,6 +152,29 @@ def test_live_buy_blocked_when_over_budget():
     assert fake.order_calls() == 0
 
 
+def test_client_order_id_passthrough():
+    """멱등키를 주면 payload.clientOrderId로 그대로 나가야(재시도 중복주문 방지의 근간)."""
+    fake = FakeToss(price=10.0, cash=100.0)
+    b = _broker(fake, live=True)
+    b.place_order(Order("AAPL", Side.BUY, 0.5), when=datetime(2026, 1, 2),
+                  client_order_id="mykey-123")
+    assert fake.last_order_body["clientOrderId"] == "mykey-123"
+
+
+def test_enforce_budget_false_skips_account_defense():
+    """enforce_budget=False면 계좌 전체가 budget 초과여도 매수가 브로커 방어에 안 막힌다.
+
+    공유 실계좌(기존 보유 존재)에선 총액이 늘 $100 초과 → CarveOutBroker가 experiment_nav로
+    방어할 때 계좌전체 방어는 꺼야 실험 매수가 가능하다.
+    """
+    fake = FakeToss(price=50.0, cash=100.0,
+                    holdings=[{"symbol": "AAPL", "quantity": "3", "averagePurchasePrice": "50"}])
+    b = TossBroker(client_id="c", client_secret="s", account_no="1", symbols=["AAPL"],
+                   budget=100.0, live=True, enforce_budget=False, transport=fake)
+    r = b.place_order(Order("AAPL", Side.BUY, 0.1), when=datetime(2026, 1, 2))
+    assert r.status == "submitted" and fake.order_calls() == 1
+
+
 def test_get_order_parses_execution():
     fake = FakeToss(price=20.0)
     b = _broker(fake, live=True)

@@ -135,6 +135,7 @@ class TossBroker(BrokerClient):
         *,
         budget: float = 100.0,
         live: bool = False,
+        enforce_budget: bool = True,
         currency: str = "USD",
         base_url: str = DEFAULT_BASE_URL,
         transport: Transport | None = None,
@@ -147,6 +148,9 @@ class TossBroker(BrokerClient):
         self.symbols = list(symbols)
         self.budget = budget
         self.live = live
+        # 계좌 전체 가치를 budget과 비교하는 방어. 공유 실계좌(기존 보유 존재)에선 항상 초과라
+        # 실험 매수가 전부 막힌다 → CarveOutBroker가 experiment_nav 기준으로 방어할 때 끈다.
+        self.enforce_budget = enforce_budget
         self.currency = currency
         self.base_url = base_url.rstrip("/")
         self._transport: Transport = transport or _urllib_transport
@@ -235,8 +239,12 @@ class TossBroker(BrokerClient):
                     item["symbol"], qty, _f(item.get("averagePurchasePrice")))
         return pf
 
-    def place_order(self, order: Order, when: datetime | None = None) -> OrderResult:
+    def place_order(self, order: Order, when: datetime | None = None,
+                    client_order_id: str | None = None) -> OrderResult:
         """시장가 주문 전송. live=False면 실제로 보내지 않고 dry-run 결과만 반환(안전 기본값).
+
+        client_order_id: 멱등성 키. 재시도 시 같은 값을 주면 서버가 중복주문을 막는다
+                         (미지정 시 매 호출 새 uuid — 재시도 안전성 없음).
 
         US 소수점 규칙:
           - 매수(BUY): 금액 기반 orderAmount(달러) 사용 — 소수점 수량은 매수 quantity 불가.
@@ -254,7 +262,8 @@ class TossBroker(BrokerClient):
             return self._reject(order, when, "시세 없음")
 
         # --- 다층 방어: 상위 Guardrail을 우회하더라도 예산 초과 노출은 브로커가 재차단 ---
-        if order.side is Side.BUY:
+        # (enforce_budget=False면 상위 카브아웃 계층이 experiment_nav로 방어 — 여기선 생략)
+        if order.side is Side.BUY and self.enforce_budget:
             try:
                 total = self.get_portfolio().total_value(prices)
                 if total > self.budget * 1.001:
@@ -268,7 +277,7 @@ class TossBroker(BrokerClient):
             "symbol": order.symbol,
             "side": order.side.value.upper(),   # BUY | SELL
             "orderType": "MARKET",
-            "clientOrderId": uuid.uuid4().hex,  # 멱등성 키(재요청 중복주문 방지)
+            "clientOrderId": client_order_id or uuid.uuid4().hex,  # 멱등성 키(재요청 중복주문 방지)
         }
         if order.side is Side.BUY:
             payload["orderAmount"] = f"{order.quantity * price:.2f}"  # 달러 금액 기반

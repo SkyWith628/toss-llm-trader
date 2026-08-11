@@ -294,7 +294,7 @@ class ProtectedPortfolio:
 
 `tests/test_carveout.py` — 1(실험 최초 0주), 2·8(실험분만 매도/초과 차단), 3(보호분 불변), 4·5(NAV 기준 리밸런싱), 9·12(대사 실패 시 fail-closed·기준선 유지), 초과체결 fail-closed, 직렬화 왕복.
 `tests/test_smoke.py` — 6(슬리피지 포함 주문가능액), NAV>초기자본 재투자 허용.
-**테스트 7은 슬리피지만 반영, 수수료(고정·비례)는 미반영** → 증분3에서 공통 비용모델로 완성 예정.
+**테스트 7 완성(증분3a)**: 공통 `CostModel`(슬리피지+비례수수료+고정수수료)을 리밸런서·브로커가 공유.
 전체(`test_smoke/llm_agent/toss_broker/forward/carveout`) 통과 — Windows/PowerShell 포함(임시경로 수정 후).
 
 ### 미완료 (다음 증분)
@@ -302,7 +302,13 @@ class ProtectedPortfolio:
 - ✅ **증분2 완료**: `state.py`가 `ExperimentPortfolio`를 임베드(페이퍼=`protected={}`),
   `runner.py`가 실체결(apply_buy/sell)로 장부 갱신 + NAV·realized_pnl·fees·status 추적.
   원장에 실험/보호 포지션 구분 노출(미귀속분은 실계좌 연결 시 추가). 페이퍼/실거래 단일 모델.
-- **증분3(live 배선)**: `CarveOutBroker` — TossBroker 감싸 ①실주문 ②실험 슬라이스만 보고 ③`get_order` 폴링 실체결 정산(부분체결) ④**멱등키 영속**(재시도 중복주문 방지). §실체결 기반 장부 갱신 / 필수테스트 10·11.
+- ✅ **증분3a 완료**: `CarveOutBroker`(`forward/carveout_broker.py`) — 실계좌 시세·보유 조회,
+  **실험 슬라이스만 보고**, experiment_cash/보유 기준 다층 방어, 멱등키로 전송, `get_order`
+  폴링으로 **실체결 정산(부분체결=filledQuantity만)**. 공통 `CostModel`(슬리피지+수수료)을
+  리밸런서·브로커가 공유(테스트7 완성). TossBroker에 `client_order_id`·`enforce_budget=False`
+  추가(계좌전체 방어는 카브아웃 계층으로 이전). mock 단위테스트 7개(부분체결·멱등·방어·dry-run).
+- **증분3b(live 배선)**: runner의 live 경로 + 주문 전후 `reconcile` + 멱등키/열린주문 **state 영속**
+  + 상태미상 시 기존주문 조회. 필수테스트 10·11(부분체결·타임아웃 재시도)의 통합 검증.
 - **증분4**: 실계좌 보호분 **기준선 초기화**(사용자 명시 확인) + runner 주문 전후 대사.
 - **증분5**: 기업행동·배당·수동매매 감지 시 halt(§추가 처리 사건).
 - **미도입**: `reserved_cash`/`reserved_sell_qty`/open orders, `Decimal` 금액(현재 float).
@@ -513,11 +519,10 @@ live 안전 운용             불가
 
 ### 다음 증분에서 (타당, 설계 필요)
 
-- **[P1] TossBroker 고정 `$100` 방어 이전** — 공유계좌에선 총자산이 처음부터 $100 초과라
-  `CarveOutBroker` 연결 시 실험 매수가 전부 차단됨. 한도 검사를 experiment_cash/NAV/예약
-  기준으로 상위 카브아웃 계층으로 이동(증분3).
-- **[P1] 수수료 공통 비용모델** — 리밸런서·브로커가 동일한 (슬리피지+고정+비례) 모델을 공유,
-  테스트7 진짜 완성(증분3).
+- ✅ **[P1] TossBroker 고정 `$100` 방어 이전 — 처리(증분3a)**: `enforce_budget=False` 플래그로
+  계좌전체 방어를 끄고, `CarveOutBroker`가 experiment_cash/보유 기준으로 재방어.
+- ✅ **[P1] 수수료 공통 비용모델 — 처리(증분3a)**: `execution/costs.py`의 `CostModel`을
+  리밸런서·브로커가 공유. 수수료 포함 사이징 테스트(테스트7) 추가.
 - **[P2] 귀속 안 된 초과분 로그 3값 구분** — 증분2에서 원장에 보호/실험 포지션을 분리 노출.
   '미귀속(actual − 보호 − 실험)'분은 실계좌 holdings가 있어야 계산되므로 증분3(reconcile+live)에서 완성.
 

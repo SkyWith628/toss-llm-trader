@@ -95,6 +95,21 @@ def test_rebalance_clipped_buys_pass_guardrail_and_fill():
     assert broker.portfolio.cash < 0.2       # 현금이 거의 소진(≈100% 배치)
 
 
+def test_rebalance_accounts_for_commission():
+    """목표비중 합 100%라도 슬리피지+수수료 포함 비용이 현금 안이라 둘 다 체결돼야(명세 테스트7)."""
+    from src.core.types import Action, Signal
+    from src.execution.costs import CostModel
+    from src.execution.rebalance import signals_to_orders
+    pf = Portfolio(cash=100.0)
+    prices = {"AAA": 40.0, "BBB": 25.0}
+    sigs = [Signal("AAA", Action.BUY, 0.5), Signal("BBB", Action.BUY, 0.5)]
+    orders = signals_to_orders(sigs, pf, prices, slippage=0.0005, commission_rate=0.001)
+    assert len(orders) == 2                       # 수수료 있어도 둘 다 주문(하나가 잘리지 않음)
+    cm = CostModel(slippage=0.0005, commission_rate=0.001)
+    total = sum(cm.buy_cost(o.quantity, prices[o.symbol]) for o in orders)
+    assert total <= 100.0 + 1e-6                  # 슬리피지+수수료 포함 실제 소요 <= 현금
+
+
 def test_no_lookahead_in_history():
     """history_until은 미래 데이터를 절대 포함하지 않아야 한다."""
     from src.data.synthetic import make_synthetic_store
