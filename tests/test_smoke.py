@@ -39,6 +39,22 @@ def test_guardrail_blocks_overspend():
     assert not d.ok and d.order is None
 
 
+def test_guardrail_allows_reinvestment_above_initial_budget():
+    """평가이익으로 NAV가 초기자본($100)을 넘어도, 가진 현금 내 매수는 허용해야(복리 재투자).
+
+    과거엔 total_value > budget이면 차단해 상승분 재매수를 막았다(측정 하향 편향).
+    """
+    g = Guardrail(budget=100.0, valid_symbols={"AAA"})
+    # NAV = 현금20 + AAA 2주*55 = 130 > 100. 그래도 현금(20) 안에서의 매수는 통과해야.
+    pf = Portfolio(cash=20.0, positions={"AAA": Position("AAA", 2.0, 50.0)})
+    prices = {"AAA": 55.0}
+    d = g.check(Order("AAA", Side.BUY, 0.3), pf, prices)  # 비용 16.5 <= 현금 20
+    assert d.ok and d.order is not None
+    # 반대로 현금을 넘는 매수는 여전히 차단(무레버리지 유지)
+    d2 = g.check(Order("AAA", Side.BUY, 1.0), pf, prices)  # 비용 55 > 현금 20
+    assert not d2.ok
+
+
 def test_guardrail_blocks_oversell():
     g = Guardrail(budget=100.0, valid_symbols={"AAA"})
     pf = Portfolio(cash=0.0, positions={"AAA": Position("AAA", 1.0, 50.0)})
