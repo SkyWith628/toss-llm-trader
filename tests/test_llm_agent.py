@@ -34,13 +34,15 @@ def _snapshot() -> MarketSnapshot:
 
 
 class _FakeMessages:
-    """anthropic client.messages.create 를 흉내내는 목."""
+    """anthropic client.messages.create 를 흉내내는 목. 호출 kwargs를 기록한다."""
 
     def __init__(self, decision: dict | None, raise_exc: bool = False):
         self._decision = decision
         self._raise = raise_exc
+        self.calls: list[dict] = []
 
     def create(self, **kwargs):
+        self.calls.append(kwargs)
         if self._raise:
             raise RuntimeError("API down")
         content = []
@@ -122,6 +124,44 @@ def test_api_failure_falls_back_to_no_change():
 def test_missing_tool_call_falls_back():
     strat = LLMAgentStrategy(client=_fake_client(decision=None))
     assert strat.generate_signal(_snapshot()) == []
+
+
+# --- 메모리·회고 ---
+
+def test_memory_retrospective_format():
+    from src.strategy.llm_agent.memory import DecisionMemory
+    mem = DecisionMemory()
+    assert mem.retrospective({"AAA": 11.0}) == ""  # 기록 전엔 빈 문자열
+    mem.record("2025-06-02", "상승 베팅", {"AAA": 0.5}, {"AAA": 10.0})
+    retro = mem.retrospective({"AAA": 11.0})  # 10 → 11 = +10%
+    assert "직전 결정 회고" in retro and "+10.00%" in retro and "상승 베팅" in retro
+
+
+def test_memory_injects_retrospective_on_second_day():
+    """2일차 호출의 프롬프트에는 1일차 회고가 붙어야 한다(연속적 의사결정)."""
+    decision = {"market_view": "1일차 판단", "positions": [
+        {"symbol": "AAA", "target_weight": 0.5, "confidence": 0.6, "rationale": "x"},
+    ]}
+    fake = _FakeMessages(decision)
+    strat = LLMAgentStrategy(client=SimpleNamespace(messages=fake))
+
+    # 1일차: 회고 없음
+    strat.generate_signal(_snapshot())
+    day1_prompt = fake.calls[0]["messages"][0]["content"]
+    assert "직전 결정 회고" not in day1_prompt
+    assert len(strat.memory) == 1
+
+    # 2일차: 프롬프트에 1일차 회고 주입
+    strat.generate_signal(_snapshot())
+    day2_prompt = fake.calls[1]["messages"][0]["content"]
+    assert "직전 결정 회고" in day2_prompt and "1일차 판단" in day2_prompt
+
+
+def test_fallback_does_not_pollute_memory():
+    """API 실패한 날은 메모리에 기록하지 않는다(회고 오염 방지)."""
+    strat = LLMAgentStrategy(client=_fake_client(raise_exc=True))
+    strat.generate_signal(_snapshot())
+    assert len(strat.memory) == 0
 
 
 if __name__ == "__main__":

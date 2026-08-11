@@ -19,6 +19,7 @@ from src.strategy.llm_agent.decision_tool import (
     TOOL_NAME,
     decision_to_signals,
 )
+from src.strategy.llm_agent.memory import DecisionMemory
 from src.strategy.llm_agent.prompts import SYSTEM_PROMPT, render_snapshot
 
 
@@ -31,12 +32,14 @@ class LLMAgentStrategy(Strategy):
         max_tokens: int = 2048,
         client: Any | None = None,
         log_path: str | None = None,
+        max_memory: int = 5,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
         self.log_path = log_path
         self.name = f"llm_agent({model})"
         self._client = client  # 테스트에서 목(mock) 주입 가능
+        self.memory = DecisionMemory(max_memory)  # 직전 결정·회고(연속적 의사결정)
 
     @property
     def client(self) -> Any:
@@ -51,12 +54,18 @@ class LLMAgentStrategy(Strategy):
         universe = sorted(snapshot.prices)
         date = snapshot.timestamp.date().isoformat()
 
+        # 회고(직전 결정+결과)를 오늘 관측치 앞에 붙여 연속적 의사결정으로.
+        user_msg = render_snapshot(snapshot)
+        retro = self.memory.retrospective(snapshot.prices)
+        if retro:
+            user_msg = f"{retro}\n\n{user_msg}"
+
         try:
             resp = self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": render_snapshot(snapshot)}],
+                messages=[{"role": "user", "content": user_msg}],
                 tools=[DECISION_TOOL],
                 tool_choice={"type": "tool", "name": TOOL_NAME},
                 thinking={"type": "disabled"},  # 강제 툴 호출 + 비용/지연 절감
@@ -71,6 +80,13 @@ class LLMAgentStrategy(Strategy):
             return []
 
         signals = decision_to_signals(decision, universe, snapshot.timestamp)
+        # 실제 결정(>0 비중)을 메모리에 남겨 다음 날 회고 재료로.
+        self.memory.record(
+            date=date,
+            market_view=decision.get("market_view", ""),
+            weights={s.symbol: s.target_weight for s in signals if s.target_weight > 0},
+            prices=snapshot.prices,
+        )
         self._log({
             "date": date,
             "model": self.model,
