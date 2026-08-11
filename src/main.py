@@ -95,8 +95,14 @@ def run(args: argparse.Namespace) -> dict:
 
     equity_curve: list[float] = []
 
+    # 결정·측정 창(window): 마지막 N일만 매매하고, 그 이전은 워밍업 history로만 쓴다.
+    # (yfinance는 항상 1년치를 받으므로 --days로 실제 거래일 수=LLM 콜 수=비용을 통제.)
+    dates = store.dates
+    if args.days and args.days < len(dates):
+        dates = dates[-args.days:]
+
     # 3) 하루씩 전진(점진적 관찰 — 미래 미포함)
-    for date in store.dates:
+    for date in dates:
         clock.set_time(date)
         prices = store.prices_on(date)
         broker.set_prices(prices)
@@ -133,8 +139,8 @@ def run(args: argparse.Namespace) -> dict:
             "fills": fills,
         })
 
-    # 4) 대조군 + 지표
-    bh_equity = buy_and_hold_equity(store, symbols, budget=args.budget)
+    # 4) 대조군 + 지표 (전략과 '같은 창'에서 측정해야 공정 비교)
+    bh_equity = buy_and_hold_equity(store, symbols, budget=args.budget, dates=dates)
     strat_metrics = compute_metrics(equity_curve)
     bh_metrics = compute_metrics(bh_equity)
 

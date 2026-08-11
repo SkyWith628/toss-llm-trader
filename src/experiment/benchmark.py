@@ -14,14 +14,17 @@ def buy_and_hold_equity(
     symbols: list[str],
     budget: float = 100.0,
     slippage: float = 0.0005,
+    dates: list | None = None,
 ) -> list[float]:
-    first = store.dates[0]
+    # dates가 주어지면 그 창(window)에서만 측정 — 전략과 동일 구간이라야 공정 비교.
+    window = dates if dates is not None else store.dates
+    first = window[0]
     p0 = store.prices_on(first)
     per_symbol_cash = budget / len(symbols)
     shares = {s: per_symbol_cash / (p0[s] * (1 + slippage)) for s in symbols}
 
     equity = []
-    for date in store.dates:
+    for date in window:
         prices = store.prices_on(date)
         equity.append(sum(shares[s] * prices[s] for s in symbols))
     return equity
