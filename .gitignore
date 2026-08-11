@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 logs/*.jsonl
+logs/forward/
 .venv/
 venv/
 .DS_Store

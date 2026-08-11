@@ -41,6 +41,22 @@ class DecisionMemory:
     def __len__(self) -> int:
         return len(self._entries)
 
+    def to_list(self) -> list[dict]:
+        """직전 결정들을 직렬화(JSON 저장용). forward 페이퍼처럼 '매일 별도 프로세스'로
+        돌 때, 회고 연속성을 프로세스 밖으로 실어 나르기 위함."""
+        return [
+            {"date": e.date, "market_view": e.market_view,
+             "weights": e.weights, "prices": e.prices}
+            for e in self._entries
+        ]
+
+    def load(self, items: list[dict]) -> None:
+        """to_list()로 저장한 항목을 되살린다(오래된→최신 순 가정, maxlen 자동 유지)."""
+        for it in items:
+            self._entries.append(MemoryEntry(
+                it["date"], it.get("market_view", ""),
+                dict(it.get("weights", {})), dict(it.get("prices", {}))))
+
     def retrospective(self, current_prices: dict[str, float]) -> str:
         """가장 최근 결정 대비 지금까지의 결과를 회고 텍스트로. 없으면 빈 문자열."""
         if not self._entries:
