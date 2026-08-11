@@ -14,7 +14,8 @@ from src.core.types import Action, Side, Signal
 from src.execution.rebalance import signals_to_orders
 from src.risk.guardrail import Guardrail
 from src.forward.experiment_portfolio import (
-    ExperimentPortfolio, ExperimentPosition, RECONCILIATION_REQUIRED)
+    ExperimentLedgerError, ExperimentPortfolio, ExperimentPosition,
+    RECONCILIATION_REQUIRED)
 from src.forward.reconcile import reconcile, reconcile_or_halt
 
 
@@ -99,6 +100,23 @@ def test_reconcile_or_halt_sets_status_without_changing_baseline():
     assert exp.protected_positions["AAPL"] == 10.0    # 기준선 자동변경 금지
 
 
+def test_apply_sell_overfill_fails_closed():
+    """실체결이 실험 귀속 수량을 초과하면 조용히 축소하지 말고 fail-closed(보호분 침범 은폐 방지)."""
+    exp = _exp(protected={"AAPL": 10.0})
+    exp.apply_buy("AAPL", 0.3, fill_price=200.0)
+    try:
+        exp.apply_sell("AAPL", 0.4, fill_price=210.0)   # 실험분 0.3 초과 체결
+        raised = False
+    except ExperimentLedgerError:
+        raised = True
+    assert raised
+    assert exp.status == RECONCILIATION_REQUIRED and not exp.can_trade
+    assert exp.status_reason and "초과 체결" in exp.status_reason
+    # 장부는 손대지 않아야(조용한 축소 금지) — 실험 0.3 그대로, 보호분 불변
+    assert exp.experiment_positions["AAPL"].quantity == 0.3
+    assert exp.protected_positions["AAPL"] == 10.0
+
+
 def test_apply_buy_sell_cash_and_fees():
     exp = _exp(cash=100.0)
     exp.apply_buy("AAA", 1.0, fill_price=40.0, commission=0.1)
@@ -113,10 +131,13 @@ def test_serialization_roundtrip():
     exp = _exp(protected={"AAPL": 10.0})
     exp.apply_buy("AAA", 0.5, fill_price=20.0, commission=0.05)
     exp.realized_pnl = 1.23
+    exp.require_reconciliation("수동매매 의심")   # 중단 사유·시각이 영속되는지도 확인
     exp2 = ExperimentPortfolio.from_dict(exp.to_dict())
     assert exp2.protected_positions == {"AAPL": 10.0}
     assert exp2.experiment_positions["AAA"].quantity == 0.5
     assert abs(exp2.realized_pnl - 1.23) < 1e-9 and exp2.status == exp.status
+    # 재시작 후에도 원인 확인 가능해야(P2 지적 반영)
+    assert exp2.status_reason == "수동매매 의심" and exp2.status_changed_at
 
 
 if __name__ == "__main__":

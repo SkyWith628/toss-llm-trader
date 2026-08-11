@@ -14,8 +14,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 
 from src.core.types import Portfolio, Position
+
+
+class ExperimentLedgerError(RuntimeError):
+    """실제 체결이 실험 장부 불변식을 위반했다. 장부는 '보정' 계층이 아니라 '검증' 계층이므로,
+    조용히 수량을 줄이지 않고 fail-closed 한다(보호분 침범을 숨기지 않기 위함)."""
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -42,6 +52,8 @@ class ExperimentPortfolio:
     realized_pnl: float = 0.0
     fees_paid: float = 0.0
     status: str = ACTIVE
+    status_reason: str = ""        # 중단/대사 사유 — 재시작 후에도 원인 확인 가능하게 영속
+    status_changed_at: str = ""    # 상태 전이 시각(ISO/UTC)
 
     # ---------- 조회 ----------
     @property
@@ -86,12 +98,21 @@ class ExperimentPortfolio:
             ep.quantity = total
 
     def apply_sell(self, symbol: str, qty: float, fill_price: float,
-                   commission: float = 0.0) -> None:
-        """실험 매도 체결 반영 — 실험 보유 한도 내에서만. 순대금만 실험 현금에 가산, 실현손익 기록."""
-        ep = self.experiment_positions.get(symbol)
-        if ep is None or qty <= 0:
+                   commission: float = 0.0, tolerance: float = 1e-6) -> None:
+        """실험 매도 체결 반영 — 순대금만 실험 현금에 가산, 실현손익 기록.
+
+        실제 체결 수량이 실험 귀속 수량을 초과하면 '조용히 축소'하지 않는다. 그건 보호분(기존
+        보유)이 침범됐다는 신호이므로 즉시 대사 필요 상태로 전환하고 예외를 던진다(fail-closed).
+        """
+        if qty <= 0:
             return
-        qty = min(qty, ep.quantity)   # 실험 귀속 초과 매도는 물리적으로 불가(보호분 침범 방지)
+        ep = self.experiment_positions.get(symbol)
+        held = ep.quantity if ep else 0.0
+        if qty > held + tolerance:
+            reason = f"{symbol} 실험 수량 초과 체결: 체결 {qty:.6f} > 실험 {held:.6f}"
+            self.require_reconciliation(reason)      # 보호분 침범 가능 → 신규 주문 중단
+            raise ExperimentLedgerError(reason)
+        qty = min(qty, held)                          # 허용오차 내 미세 초과분만 보정(음수 방지)
         net_proceeds = qty * fill_price - commission
         self.cash += net_proceeds
         self.fees_paid += commission
@@ -103,12 +124,14 @@ class ExperimentPortfolio:
     # ---------- 상태 전이(fail-closed) ----------
     def halt(self, reason: str) -> None:
         self.status = HALTED
-        self._halt_reason = reason  # 로깅용(직렬화 대상 아님)
+        self.status_reason = reason
+        self.status_changed_at = _now_iso()
 
     def require_reconciliation(self, reason: str) -> None:
         if self.status == ACTIVE:
             self.status = RECONCILIATION_REQUIRED
-        self._halt_reason = reason
+        self.status_reason = reason
+        self.status_changed_at = _now_iso()
 
     # ---------- 직렬화(state.json 통합용) ----------
     def to_dict(self) -> dict:
@@ -130,4 +153,6 @@ class ExperimentPortfolio:
             realized_pnl=data.get("realized_pnl", 0.0),
             fees_paid=data.get("fees_paid", 0.0),
             status=data.get("status", ACTIVE),
+            status_reason=data.get("status_reason", ""),
+            status_changed_at=data.get("status_changed_at", ""),
         )

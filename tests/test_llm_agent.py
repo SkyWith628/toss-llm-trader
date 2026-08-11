@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -99,21 +100,21 @@ def test_clamps_negative_and_garbage_values():
 
 # --- 전략 통합(목 클라이언트) ---
 
-def test_generate_signal_parses_tool_call(tmp_log="/tmp/_llm_test.jsonl"):
-    if os.path.exists(tmp_log):
-        os.remove(tmp_log)
-    decision = {"market_view": "테스트", "positions": [
-        {"symbol": "AAA", "target_weight": 0.6, "confidence": 0.7, "rationale": "모멘텀"},
-    ]}
-    strat = LLMAgentStrategy(client=_fake_client(decision), log_path=tmp_log)
-    signals = strat.generate_signal(_snapshot())
-    assert len(signals) == len(_UNIVERSE)
-    assert any(s.target_weight == 0.6 for s in signals)
-    # 결정 로그가 원장과 별도로 남았는지
-    with open(tmp_log, encoding="utf-8") as f:
-        rec = json.loads(f.readline())
-    assert rec["market_view"] == "테스트" and rec["usage"]["input_tokens"] == 100
-    os.remove(tmp_log)
+def test_generate_signal_parses_tool_call():
+    # 고정 /tmp 경로 대신 임시 디렉터리 — Windows(네이티브 파이썬)에서도 안전.
+    with tempfile.TemporaryDirectory() as d:
+        tmp_log = os.path.join(d, "_llm_test.jsonl")
+        decision = {"market_view": "테스트", "positions": [
+            {"symbol": "AAA", "target_weight": 0.6, "confidence": 0.7, "rationale": "모멘텀"},
+        ]}
+        strat = LLMAgentStrategy(client=_fake_client(decision), log_path=tmp_log)
+        signals = strat.generate_signal(_snapshot())
+        assert len(signals) == len(_UNIVERSE)
+        assert any(s.target_weight == 0.6 for s in signals)
+        # 결정 로그가 원장과 별도로 남았는지
+        with open(tmp_log, encoding="utf-8") as f:
+            rec = json.loads(f.readline())
+        assert rec["market_view"] == "테스트" and rec["usage"]["input_tokens"] == 100
 
 
 def test_api_failure_falls_back_to_no_change():
