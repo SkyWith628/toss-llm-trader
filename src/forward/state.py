@@ -16,6 +16,15 @@ from dataclasses import dataclass, field
 from src.core.types import Portfolio
 from src.forward.experiment_portfolio import ExperimentPortfolio
 
+SCHEMA_VERSION = 2   # state.json 형식 버전. 구버전(필드 상이)은 로드 시 fail-closed.
+
+
+def _config_diff(a: dict, b: dict) -> str:
+    """두 canonical 설정의 차이를 사람이 읽을 문자열로. 같으면 빈 문자열."""
+    keys = sorted(set(a) | set(b))
+    diffs = [f"{k}: {a.get(k)!r}→{b.get(k)!r}" for k in keys if a.get(k) != b.get(k)]
+    return ", ".join(diffs)
+
 
 @dataclass
 class ForwardState:
@@ -36,21 +45,32 @@ class ForwardState:
     # 직전 거래일에 내린 결정 — '오늘' 체결한다(시점누수 방지: 당일종가 신호를 당일 체결하지 않음).
     # 각 항목: {"symbol","action","target_weight","rationale"}
     pending_signals: list[dict] = field(default_factory=list)
+    schema_version: int = SCHEMA_VERSION
+    config: dict = field(default_factory=dict)   # 결과에 영향 주는 설정(재실행 시 대조)
 
     # ---------- 로드/초기화/저장 ----------
     @classmethod
     def load_or_init(
         cls, path: str, *, budget: float, symbols: list[str],
-        source: str, strategy: str, model: str,
+        source: str, strategy: str, model: str, config: dict | None = None,
     ) -> "ForwardState":
         """기존 state.json이 있으면 로드, 없으면 예산 전액 현금으로 신규 실험 시작.
 
-        기존 파일이 있으면 예산·종목 구성이 바뀌었는지 검사해 실수로 다른 실험을
-        같은 파일에 섞지 않도록 막는다(측정 오염 방지).
+        기존 파일이 있으면 스키마 버전·예산·종목·결과영향 설정(config)이 바뀌었는지 검사해
+        실수로 다른 실험을 같은 파일에 섞지 않도록 막는다(측정 오염 방지, fail-closed).
         """
+        check_config = config is not None   # None이면 '검사 안 함'(상태 조회 목적)
+        config = dict(config or {})
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
+            ver = data.get("schema_version")
+            if ver is None:
+                raise ValueError(
+                    "구버전 상태 형식입니다(schema_version 없음). 리셋하거나 새 --state-dir로 시작하세요.")
+            if ver > SCHEMA_VERSION:
+                raise ValueError(
+                    f"지원하지 않는 상태 버전 {ver}(>{SCHEMA_VERSION}). 최신 코드로 여세요.")
             exp = ExperimentPortfolio.from_dict(data["experiment"])
             st = cls(
                 budget=data["budget"], symbols=list(data["symbols"]),
@@ -61,22 +81,30 @@ class ForwardState:
                 bh_shares=dict(data.get("bh_shares") or {}),
                 bh_anchor=dict(data.get("bh_anchor") or {}),
                 memory=list(data.get("memory") or []),
-                pending_signals=list(data.get("pending_signals") or []))
+                pending_signals=list(data.get("pending_signals") or []),
+                schema_version=ver, config=dict(data.get("config") or {}))
             if abs(st.budget - budget) > 1e-9 or sorted(st.symbols) != sorted(symbols):
                 raise ValueError(
                     f"기존 실험과 구성이 다릅니다(budget/symbols). "
                     f"새 실험은 다른 --state-dir을 쓰세요. 기존={st.symbols}@${st.budget}")
+            if check_config:
+                diff = _config_diff(st.config, config)
+                if diff:
+                    raise ValueError(
+                        f"기존 실험과 설정이 다릅니다({diff}). 다른 실험이 한 성과곡선에 "
+                        f"섞이지 않게 새 --state-dir을 쓰세요.")
             return st
         # 신규: 페이퍼는 보호분 없음(protected_positions={}), 예산 전액이 실험 현금.
         exp = ExperimentPortfolio(initial_capital=budget, cash=budget)
         return cls(budget=budget, symbols=list(symbols), source=source,
-                   strategy=strategy, model=model, experiment=exp)
+                   strategy=strategy, model=model, experiment=exp, config=config)
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
+            "schema_version": SCHEMA_VERSION,
             "budget": self.budget, "symbols": self.symbols, "source": self.source,
-            "strategy": self.strategy, "model": self.model,
+            "strategy": self.strategy, "model": self.model, "config": self.config,
             "started_at": self.started_at, "last_run_date": self.last_run_date,
             "day_count": self.day_count,
             "experiment": self.experiment.to_dict() if self.experiment else None,

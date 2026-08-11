@@ -493,6 +493,255 @@ live 안전 운용             불가
 
 ---
 
+## Codex 2차 재검토 피드백 (2026-08-12)
+
+### 총평
+
+이전 재검토에서 지적한 항목 대부분이 정상적으로 반영됐다. 전체 테스트 파일과 `compileall`도 현재 환경에서 모두 통과했다.
+
+특히 다음 변경은 적절하다.
+
+- 초과 매도 체결 시 fail-closed
+- 상태 중단 사유와 시각 영속화
+- 공통 `CostModel`을 이용한 슬리피지·수수료 반영
+- Forward runner에 `cfg.slippage` 전달
+- 고정 `$100` 상한 제거 및 실험 NAV 복리 재투자
+- `ExperimentPortfolio`와 `ForwardState` 통합
+- 직전 거래일 결정의 next-bar 집행으로 당일 종가 시점 누수 제거
+- Windows 비호환 임시 테스트 경로 수정
+- TossBroker에 외부 `client_order_id` 전달 지원
+- 공유 계좌에서 계좌 전체 예산 검사를 끌 수 있는 `enforce_budget=False` 추가
+- 보호 포지션과 실험 포지션의 구조적 분리
+
+그러나 **부분 체결, 열린 주문 영속성, 실주문 조회, 프로세스 재시작 복구**가 아직 완성되지 않았으므로 live 활성화 조건은 여전히 충족되지 않는다.
+
+### [P1] 부분 체결을 최종 체결로 종료하면 안 됨
+
+현재 Toss 주문 상태 매핑에서 `PARTIAL_FILLED`가 내부 `filled`로 정규화되고, `CarveOutBroker._settle()`은 `filled`를 종결 상태로 판단해 폴링을 끝낸다.
+
+예시:
+
+```text
+주문 수량:             1.0주
+현재 체결 수량:         0.4주
+실제 열린 주문 잔량:     0.6주
+현재 내부 반환 상태:     filled
+```
+
+이 경우 0.4주만 장부에 반영된 뒤 주문이 끝난 것으로 처리되지만, 실제 계좌에서는 0.6주가 계속 체결될 수 있다. 예약 현금·예약 매도 수량을 해제하거나 새 주문을 보내면 실험 한도를 초과할 수 있다.
+
+내부 주문 상태를 최소한 다음처럼 분리해야 한다.
+
+```text
+submitted
+partially_filled
+filled
+rejected
+canceled
+```
+
+부분 체결 처리 요구사항:
+
+1. `filledQuantity`는 누적값인지 증분값인지 API 계약을 기준으로 명확히 처리한다.
+2. 이미 장부에 반영한 수량을 `accounted_filled_qty`로 영속화한다.
+3. 새로 증가한 체결분만 장부에 반영한다.
+4. 잔량에 해당하는 현금 또는 매도 수량을 계속 예약한다.
+5. 완전체결·취소·거부 전까지 열린 주문으로 유지한다.
+6. 프로세스 재시작 후에도 동일 주문 ID를 다시 조회해 정산을 이어간다.
+
+현재 `test_partial_fill_reports_filled_quantity_only`는 절반만 체결됐는데도 `status == "filled"`를 정상으로 기대하므로 수정이 필요하다.
+
+### [P1] 주문 상세 조회에 계좌 헤더 필요
+
+현재 `TossBroker.get_order()`는 다음과 같이 주문 상세를 조회한다.
+
+```python
+result = self._get(f"/api/v1/orders/{urllib.parse.quote(order_id)}")
+```
+
+토스 주문·주문 조회 API는 `X-Tossinvest-Account` 계좌 헤더가 필요한 범주이므로 다음과 같이 호출해야 한다.
+
+```python
+result = self._get(
+    f"/api/v1/orders/{urllib.parse.quote(order_id)}",
+    account=True,
+)
+```
+
+테스트 Fake transport도 주문 상세 조회 시 계좌 헤더 존재 여부를 검증해야 한다. 현재 테스트는 URL과 응답만 검사하므로 이 누락을 잡지 못한다.
+
+### [P1] 실제 매수 체결 비용이 실험 현금을 넘을 때 fail-closed 필요
+
+`ExperimentPortfolio.apply_buy()`는 실제 체결가와 수수료를 장부에 반영하지만, 차감 후 실험 현금이 음수가 되어도 상태가 `active`로 유지된다.
+
+주문 전 예상 가격과 실제 체결 가격은 다를 수 있다.
+
+```text
+주문 전 예상 비용 <= 실험 현금
+실제 체결 비용     > 실험 현금
+```
+
+장부는 실제 체결 비용을 줄여 기록해서는 안 된다. 실제 값을 모두 기록한 뒤 즉시 대사 필요 상태로 전환해야 한다.
+
+```python
+actual_cost = qty * fill_price + commission
+self.cash -= actual_cost
+
+if self.cash < -tolerance:
+    self.require_reconciliation("실제 매수 체결 비용이 실험 현금 초과")
+    raise ExperimentLedgerError(...)
+```
+
+필수 테스트:
+
+- 주문 전 가격 기준으로는 허용되지만 실제 체결가 상승으로 현금이 음수가 되는 경우
+- 실제 수수료가 예상 수수료보다 커 현금이 음수가 되는 경우
+- 오류 후 `status == reconciliation_required`
+- 오류 사유와 시각의 직렬화 왕복
+
+### [P1] 멱등 키·주문 ID·누적 체결량을 영속화해야 함
+
+`CarveOutBroker`가 외부 `client_order_id`를 받고 TossBroker가 이를 그대로 전송하도록 변경한 것은 올바른 기반이다. 그러나 현재 키와 주문 상태가 `ForwardState`에 저장되지 않는다.
+
+위험 시나리오:
+
+```text
+1. 주문을 토스에 전송
+2. 토스에서 주문 접수 또는 체결
+3. state.json 저장 전에 프로세스 종료
+4. 다음 실행은 기존 clientOrderId와 orderId를 알지 못함
+5. 새 주문을 전송하여 중복 주문 가능
+```
+
+동일 프로세스에서 같은 문자열을 두 번 전달하는 테스트만으로는 충분하지 않다. 프로세스를 재시작하고 상태 파일에서 동일 주문을 복원하는 테스트가 필요하다.
+
+권장 열린 주문 모델:
+
+```json
+{
+  "open_orders": {
+    "intent-id": {
+      "client_order_id": "stable-key",
+      "broker_order_id": "order-id",
+      "symbol": "AAPL",
+      "side": "buy",
+      "requested_qty": 1.0,
+      "accounted_filled_qty": 0.4,
+      "reserved_cash": 6.1,
+      "reserved_sell_qty": 0.0,
+      "status": "partially_filled",
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  }
+}
+```
+
+주문 의도와 멱등 키를 주문 전송 **이전**에 영속화해야 한다. 전송 후 저장하는 구조는 여전히 충돌 창이 있다.
+
+### [P1] 기존 Forward 상태 형식에 대한 버전·마이그레이션 필요
+
+현재 `ForwardState.load_or_init()`은 기존 상태 파일에 `experiment` 필드가 있다고 가정한다. 이전 버전의 상태는 `cash`와 `positions` 형식이므로 `KeyError`가 발생할 수 있다.
+
+권장 방식:
+
+```json
+{
+  "schema_version": 2,
+  "experiment": {},
+  "open_orders": {}
+}
+```
+
+로드 정책:
+
+1. `schema_version`이 없으면 구버전으로 판정한다.
+2. 페이퍼 상태는 명시적인 변환 함수를 통해 마이그레이션할 수 있다.
+3. 실계좌 보호 기준선은 자동 추정하지 않는다.
+4. 실계좌 상태 마이그레이션은 사용자 확인 또는 새로운 `state_dir`을 요구한다.
+5. 지원하지 않는 미래 버전은 친절한 오류와 함께 fail-closed 한다.
+
+### [P2] Forward 상태와 equity 로그의 원자성 문제
+
+현재 runner는 `state.json`을 먼저 저장한 후 `equity.jsonl`을 append한다. 두 작업 사이에 프로세스가 종료되면 상태에는 해당 날짜가 실행 완료로 기록되지만 성과 로그에는 행이 없다. 재실행은 같은 날짜 중복 방지에 걸려 skip된다.
+
+실주문과 열린 주문까지 연결되면 단순 JSON 파일 두 개의 쓰기 순서만으로는 복구를 보장하기 어렵다.
+
+권장 방식:
+
+- SQLite 트랜잭션으로 state·order·fill·daily equity를 함께 저장
+- 또는 일별 write-ahead journal을 먼저 기록하고 완료 마커를 남기는 복구 프로토콜
+
+### [P2] 실험 구성 변경 검사를 확대해야 함
+
+현재 기존 상태와 새 실행 설정 비교는 예산과 종목만 검사한다. 같은 상태 디렉터리에서 다음 설정이 바뀌면 서로 다른 실험이 하나의 성과 곡선에 섞일 수 있다.
+
+- 데이터 소스
+- 전략
+- LLM 모델
+- lookback
+- slippage
+- commission rate
+- fixed fee
+- min trade
+- 체결 모델 버전
+
+실험 결과에 영향을 주는 설정을 canonical config 또는 config hash로 저장하고 재실행 시 비교해야 한다.
+
+### 2차 검증 결과
+
+현재 환경에서 직접 실행한 결과:
+
+```text
+test_carveout.py          통과
+test_carveout_broker.py   통과
+test_forward.py           통과
+test_llm_agent.py         통과
+test_smoke.py             통과
+test_toss_broker.py       통과
+compileall                통과
+```
+
+테스트 통과는 현재 구현된 동작의 회귀가 없다는 의미다. 부분 체결 상태 분리, 프로세스 재시작 복구, 실제 계좌 헤더 검증 등 아직 구현되지 않은 시나리오의 안전성을 보증하지는 않는다.
+
+### 갱신된 구현 우선순위
+
+1. `PARTIAL_FILLED`를 `partially_filled`로 분리한다.
+2. 열린 주문, 예약 현금, 예약 매도 수량, 누적 장부 반영량을 모델링한다.
+3. 주문 의도와 안정적인 `client_order_id`를 전송 전에 영속화한다.
+4. `TossBroker.get_order()`에 계좌 헤더를 추가하고 테스트한다.
+5. 실제 매수 비용 초과 시 `ExperimentPortfolio`를 fail-closed 한다.
+6. 상태 스키마 버전과 안전한 마이그레이션을 추가한다.
+7. 프로세스 재시작 후 부분 체결·미체결 주문 복구 테스트를 추가한다.
+8. 주문 전후 실계좌 대사를 runner에 연결한다.
+9. state·order·fill·equity 저장의 트랜잭션 또는 복구 프로토콜을 구현한다.
+10. 실험 구성 전체를 상태에 고정하고 변경 시 새 실험 디렉터리를 요구한다.
+11. 보호 기준선 초기화와 사용자 명시 확인 절차를 구현한다.
+12. 모든 live 완료 조건이 충족된 뒤에만 실주문 경로를 활성화한다.
+
+### 2차 검토 시점 완료도
+
+```text
+페이퍼 백테스트·Forward    상당히 개선됨
+카브아웃 순수 장부          양호
+NAV 복리 재투자             완료
+보호분 제외 리밸런싱         단위 로직 완료
+next-bar 시점 누수 제거      완료
+공통 비용 모델              완료
+실주문 래퍼 단위 구조        양호
+부분 체결 상태·잔량 추적      미완료
+열린 주문·예약 자산 영속      미완료
+프로세스 재시작 멱등성        미완료
+실주문 조회 계좌 헤더         수정 필요
+실제 비용 초과 fail-closed    미완료
+상태 스키마 마이그레이션      미완료
+실계좌 주문 전후 대사         미완료
+보호 기준선 사용자 확인       미완료
+live 안전 운용               불가
+```
+
+---
+
 ## Codex 피드백 반영 (2026-08-12, Claude)
 
 재검토 8개 항목을 코드와 대조 검증 후 조치. 1건은 이미 반영돼 있었음.
@@ -527,3 +776,35 @@ live 안전 운용             불가
   '미귀속(actual − 보호 − 실험)'분은 실계좌 holdings가 있어야 계산되므로 증분3(reconcile+live)에서 완성.
 
 live 활성화는 위 증분3~5 + 완료 조건 충족 전까지 금지(변동 없음).
+
+---
+
+## Codex 2차 피드백 반영 (2026-08-12, Claude)
+
+3차(2차 재검토) 8개 지적을 코드로 전부 확인 — 이번엔 **스테일 없이 모두 타당**. 빠른 정정 4건 처리, 나머지는 증분3b.
+
+### 이번에 처리 (빠른 정정)
+
+- ✅ **[P1] 부분체결을 최종체결로 종료 금지** — `PARTIAL_FILLED`를 `filled`로 정규화하던 것을
+  분리(`partially_filled`). `CarveOutBroker._settle`은 `filled/rejected`만 종결로 보므로 부분체결
+  시 폴링을 계속한다. 잘못된 기대를 박제한 테스트를 `test_partial_fill_not_finalized`로 수정
+  (첫 partial에서 멈추지 않고 끝까지 폴링·filled로 종결 안 함 검증).
+- ✅ **[P1] `get_order` 계좌 헤더** — `_get(..., account=True)` 추가. Fake transport가 주문조회 시
+  `X-Tossinvest-Account` 존재를 검증(`test_get_order_sends_account_header`).
+- ✅ **[P1] `apply_buy` 실비용 초과 fail-closed** — 실제 체결가·수수료 차감 후 현금이 음수면
+  값을 줄이지 않고 실제로 기록한 뒤 `reconciliation_required` 전환+예외. 체결가 상승·수수료
+  초과 2케이스 + 직렬화 보존 테스트.
+- ✅ **[P2] 구성변경 검사 확대 + 스키마 버전** — `state.json`에 `schema_version=2`와 canonical
+  `config`(source/strategy/model/lookback/min_trade/slippage/commission/fixed_fee/days/seed) 저장.
+  재실행 시 불일치하면 차이를 적시해 fail-closed. 구버전(스키마 없음)은 KeyError 대신 친절한 중단.
+
+### 증분3b (핵심 — 재시작 안전·대사 배선)
+
+- **[P1] 멱등키·주문ID·누적체결 영속** — `ForwardState.open_orders`(client_order_id·broker_order_id·
+  `accounted_filled_qty`·reserved cash/qty·status)를 **전송 前** 저장. 증분 체결만 반영, 완전체결·
+  취소·거부 전까지 열린 주문 유지. **프로세스 재시작 복구 테스트**(기존 주문 재조회→정산 이어감→
+  중복주문 없음). 동일프로세스 2회 호출 테스트로는 불충분하다는 지적 반영.
+- **[P2] state·order·fill·equity 저장 원자성** — 완료마커/WAL 또는 SQLite 트랜잭션.
+- runner의 live 경로 + 주문 전후 `reconcile` 배선(증분3b), 보호분 기준선 초기화(증분4).
+
+전체 테스트(6파일)+`compileall` 통과. live는 3b~4 완료 전까지 계속 금지.

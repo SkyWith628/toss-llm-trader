@@ -117,6 +117,34 @@ def test_apply_sell_overfill_fails_closed():
     assert exp.protected_positions["AAPL"] == 10.0
 
 
+def test_apply_buy_over_cash_fails_closed():
+    """실제 체결가 상승으로 현금이 음수가 되면 fail-closed(계좌 다른 현금 잠식 은폐 방지)."""
+    exp = _exp(cash=10.0)
+    try:
+        exp.apply_buy("AAA", 1.0, fill_price=15.0)   # 15 > 현금 10 → 현금 -5
+        raised = False
+    except ExperimentLedgerError:
+        raised = True
+    assert raised
+    assert exp.status == RECONCILIATION_REQUIRED and not exp.can_trade
+    assert exp.status_reason and "현금 초과" in exp.status_reason
+    assert exp.experiment_positions["AAA"].quantity == 1.0   # 실제 값은 기록됨(줄이지 않음)
+    # 사유·시각이 직렬화 왕복에도 보존
+    exp2 = ExperimentPortfolio.from_dict(exp.to_dict())
+    assert exp2.status == RECONCILIATION_REQUIRED and exp2.status_reason and exp2.status_changed_at
+
+
+def test_apply_buy_over_cash_by_commission_fails_closed():
+    """수수료가 예상보다 커서 현금이 음수가 되는 경우도 fail-closed."""
+    exp = _exp(cash=10.0)
+    try:
+        exp.apply_buy("AAA", 0.6, fill_price=16.0, commission=0.5)  # 9.6+0.5=10.1 > 10
+        raised = False
+    except ExperimentLedgerError:
+        raised = True
+    assert raised and exp.status == RECONCILIATION_REQUIRED
+
+
 def test_apply_buy_sell_cash_and_fees():
     exp = _exp(cash=100.0)
     exp.apply_buy("AAA", 1.0, fill_price=40.0, commission=0.1)

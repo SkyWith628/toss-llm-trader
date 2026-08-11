@@ -83,11 +83,16 @@ class ExperimentPortfolio:
 
     # ---------- 실제 체결 반영(장부는 요청값이 아니라 체결값으로만 갱신) ----------
     def apply_buy(self, symbol: str, qty: float, fill_price: float,
-                  commission: float = 0.0) -> None:
-        """실험 매수 체결 반영 — 실험 현금 차감, 실험 포지션 가중평균 갱신."""
+                  commission: float = 0.0, tolerance: float = 1e-6) -> None:
+        """실험 매수 체결 반영 — 실험 현금 차감, 실험 포지션 가중평균 갱신.
+
+        주문 전 예상보다 실제 체결가·수수료가 커서 차감 후 실험 현금이 음수가 되면(계좌의
+        다른 현금을 실험이 잠식) 값을 줄여 기록하지 않는다. 실제 값을 모두 기록한 뒤 즉시
+        대사 필요 상태로 전환하고 예외를 던진다(fail-closed).
+        """
         if qty <= 0:
             return
-        self.cash -= qty * fill_price + commission
+        self.cash -= qty * fill_price + commission   # 실제 체결값 그대로 기록
         self.fees_paid += commission
         ep = self.experiment_positions.get(symbol)
         if ep is None:
@@ -96,6 +101,10 @@ class ExperimentPortfolio:
             total = ep.quantity + qty
             ep.avg_price = (ep.avg_price * ep.quantity + fill_price * qty) / total
             ep.quantity = total
+        if self.cash < -tolerance:
+            reason = f"{symbol} 실제 매수 체결 비용이 실험 현금 초과: 현금 {self.cash:.4f}"
+            self.require_reconciliation(reason)
+            raise ExperimentLedgerError(reason)
 
     def apply_sell(self, symbol: str, qty: float, fill_price: float,
                    commission: float = 0.0, tolerance: float = 1e-6) -> None:

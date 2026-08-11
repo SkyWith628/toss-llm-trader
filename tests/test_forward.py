@@ -168,6 +168,37 @@ def test_config_mismatch_guard():
         assert raised
 
 
+def test_config_change_detected():
+    """예산·종목이 같아도 결과영향 설정(전략 등)이 바뀌면 같은 state 재사용을 막아야."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d)
+        store = make_synthetic_store(cfg.symbols, days=30, seed=9)
+        run_once(cfg, store=store, today=store.dates[10], strategy=FixedStrategy({"AAA": 0.5}))
+        try:
+            ForwardState.load_or_init(cfg.state_path, budget=100.0, symbols=cfg.symbols,
+                                      source="synthetic", strategy="llm", model="-",
+                                      config={**cfg.canonical(), "strategy": "llm"})
+            raised = False
+        except ValueError as e:
+            raised = "strategy" in str(e)
+        assert raised
+
+
+def test_old_schema_fails_closed():
+    """schema_version 없는 구버전 상태 파일은 친절히 fail-closed(KeyError 대신)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "state.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"budget":100.0,"symbols":["AAA"],"cash":100.0,"positions":{}}')  # 구형식
+        try:
+            ForwardState.load_or_init(path, budget=100.0, symbols=["AAA"],
+                                      source="synthetic", strategy="momentum", model="-")
+            raised = False
+        except ValueError as e:
+            raised = "구버전" in str(e)
+        assert raised
+
+
 def test_report_reads_equity():
     """--report 경로: equity.jsonl 누적에서 전략·B&H 지표를 계산."""
     with tempfile.TemporaryDirectory() as d:

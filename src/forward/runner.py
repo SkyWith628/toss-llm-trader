@@ -35,9 +35,20 @@ class ForwardConfig:
     lookback: int = 20
     min_trade: float = 1.0
     slippage: float = 0.0005
+    commission_rate: float = 0.0    # 거래대금 비례 수수료(리밸런서·브로커 공유)
+    fixed_fee: float = 0.0          # 건당 고정 수수료
     days: int = 250              # synthetic/yfinance history 길이
     seed: int = 42
     state_dir: str = ""          # logs/forward (CLI가 절대경로로 채움)
+
+    def canonical(self) -> dict:
+        """결과에 영향 주는 설정 — state에 고정해 재실행 시 대조(다른 실험 혼입 방지)."""
+        return {
+            "source": self.source, "strategy": self.strategy, "model": self.model,
+            "lookback": self.lookback, "min_trade": self.min_trade,
+            "slippage": self.slippage, "commission_rate": self.commission_rate,
+            "fixed_fee": self.fixed_fee, "days": self.days, "seed": self.seed,
+        }
 
     @property
     def state_path(self) -> str:
@@ -87,7 +98,8 @@ def run_once(
     """
     state = ForwardState.load_or_init(
         cfg.state_path, budget=cfg.budget, symbols=cfg.symbols,
-        source=cfg.source, strategy=cfg.strategy, model=cfg.model)
+        source=cfg.source, strategy=cfg.strategy, model=cfg.model,
+        config=cfg.canonical())
 
     store = store or _build_store(cfg)
     date = today or store.dates[-1]
@@ -104,7 +116,7 @@ def run_once(
     exp = state.experiment   # 실험 장부(단일 모델). 페이퍼는 protected_positions={}.
     # 페이퍼 브로커는 '체결 시뮬레이터' — 실험 장부는 실제 체결값으로 갱신한다(apply_buy/sell).
     broker = PaperBroker(starting_cash=exp.cash, slippage=cfg.slippage,
-                         min_notional=cfg.min_trade)
+                         commission_rate=cfg.commission_rate, min_notional=cfg.min_trade)
     broker.portfolio = exp.to_portfolio()
     broker.set_prices(prices)
 
@@ -116,7 +128,8 @@ def run_once(
     # 결정을 오늘 가격에 집행한다. 첫 실행엔 pending이 없어 매매가 없다(전량 현금).
     pending = _signals_from_dicts(state.pending_signals, date)
     orders = signals_to_orders(pending, broker.get_portfolio(), prices,
-                               cfg.min_trade, slippage=cfg.slippage)
+                               cfg.min_trade, slippage=cfg.slippage,
+                               commission_rate=cfg.commission_rate)
 
     fills = []
     for order in orders:

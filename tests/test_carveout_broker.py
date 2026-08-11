@@ -29,6 +29,7 @@ class FakeInner:
         self.key_to_oid: dict[str, str] = {}    # clientOrderId -> orderId (멱등 dedup)
         self._orders: dict[str, Order] = {}
         self.placed: list = []
+        self.get_order_calls = 0
 
     def get_prices(self):
         return {"AAPL": self.price}
@@ -53,10 +54,13 @@ class FakeInner:
         return OrderResult(order, 0.0, 0.0, 0.0, "submitted", when, oid)
 
     def get_order(self, order_id):
+        self.get_order_calls += 1
         order = self._orders[order_id]
         filled = order.quantity * self.fill_ratio
+        # 부분체결은 종결이 아님(partially_filled) — 완전체결(fill_ratio>=1)만 filled.
+        status = "filled" if self.fill_ratio >= 1.0 else "partially_filled"
         return OrderResult(order, filled, self.price, self.commission,
-                           "filled", datetime.now(), order_id)
+                           status, datetime.now(), order_id)
 
 
 def _exp(cash=100.0, experiment=None):
@@ -81,11 +85,14 @@ def test_buy_full_fill_settles():
     assert r.status == "filled" and abs(r.filled_qty - 0.5) < 1e-9 and r.fill_price == 10.0
 
 
-def test_partial_fill_reports_filled_quantity_only():
-    inner = FakeInner(price=10.0, fill_ratio=0.5)   # 요청 1.0 중 0.5만 체결
-    c = _carve(inner, _exp(cash=100.0))
+def test_partial_fill_not_finalized():
+    """부분체결을 최종체결로 종료하면 안 됨(Codex P1) — 종결로 안 보고 폴링을 계속해야."""
+    inner = FakeInner(price=10.0, fill_ratio=0.5)   # 요청 1.0 중 0.5만 체결(계속 partial)
+    c = _carve(inner, _exp(cash=100.0))             # poll_attempts=3
     r = c.place_and_settle(Order("AAPL", Side.BUY, 1.0), client_order_id="k2")
-    assert r.status == "filled" and abs(r.filled_qty - 0.5) < 1e-9   # 체결분만
+    assert r.status == "partially_filled"           # filled로 종결시키지 않음
+    assert abs(r.filled_qty - 0.5) < 1e-9           # 반영은 체결분만
+    assert inner.get_order_calls == 3               # 첫 partial에서 멈추지 않고 끝까지 폴링
 
 
 def test_buy_blocked_over_experiment_cash():

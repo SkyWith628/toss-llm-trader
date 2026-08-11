@@ -35,6 +35,7 @@ class FakeToss:
         self.calls: list[tuple[str, str]] = []   # (method, path)
         self.last_order_body = None
         self.token_issued = 0
+        self.order_detail_had_account = None     # 주문조회 시 계좌헤더 존재 여부
 
     def __call__(self, method, url, headers, body):
         path = url.split("?", 1)[0].replace("https://openapi.tossinvest.com", "")
@@ -57,6 +58,7 @@ class FakeToss:
             self.last_order_body = json.loads(body.decode())
             return 201, {"result": {"orderId": "ord-1", "clientOrderId": None}}
         if path.startswith("/api/v1/orders/"):
+            self.order_detail_had_account = "X-Tossinvest-Account" in headers
             return 200, {"result": {"orderId": "ord-1", "symbol": "AAPL", "side": "BUY",
                                     "quantity": "1", "status": "FILLED",
                                     "execution": {"filledQuantity": "1",
@@ -181,6 +183,14 @@ def test_get_order_parses_execution():
     r = b.get_order("ord-1")
     assert r.status == "filled"
     assert r.filled_qty == 1.0 and r.fill_price == 20.0 and r.commission == 0.01
+
+
+def test_get_order_sends_account_header():
+    """주문 상세 조회는 X-Tossinvest-Account 헤더가 필요한 범주(Codex P1)."""
+    fake = FakeToss(price=20.0)
+    b = _broker(fake, live=True)
+    b.get_order("ord-1")
+    assert fake.order_detail_had_account is True
 
 
 def test_decode_body_handles_gzip():

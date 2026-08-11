@@ -41,7 +41,9 @@ Transport = Callable[[str, str, dict[str, str], bytes | None], "tuple[int, dict]
 DEFAULT_BASE_URL = "https://openapi.tossinvest.com"
 
 # 주문 상태(OrderStatus) -> 내부 OrderResult.status 로 축약
-_FILLED = {"FILLED", "PARTIAL_FILLED"}
+# 부분체결은 '종결'이 아니다 — 잔량이 계속 체결될 수 있어 filled와 구분한다(폴링 지속).
+_FILLED = {"FILLED"}
+_PARTIAL = {"PARTIAL_FILLED"}
 _REJECTED = {"REJECTED", "CANCELED", "CANCEL_REJECTED", "REPLACE_REJECTED"}
 
 
@@ -300,11 +302,14 @@ class TossBroker(BrokerClient):
     # ================= 체결 조회(비동기 주문 정산) =================
     def get_order(self, order_id: str) -> OrderResult:
         """주문 상세를 조회해 체결 결과(OrderResult)로 변환 — 원장 정산에 사용."""
-        result = self._get(f"/api/v1/orders/{urllib.parse.quote(order_id)}")
+        # 주문 조회는 계좌 컨텍스트가 필요한 범주 → X-Tossinvest-Account 헤더 포함.
+        result = self._get(f"/api/v1/orders/{urllib.parse.quote(order_id)}", account=True)
         side = Side.BUY if str(result.get("side", "")).upper() == "BUY" else Side.SELL
         order = Order(result.get("symbol", ""), side, _f(result.get("quantity")))
         raw = str(result.get("status", "")).upper()
-        status = "filled" if raw in _FILLED else "rejected" if raw in _REJECTED else "submitted"
+        status = ("filled" if raw in _FILLED else
+                  "partially_filled" if raw in _PARTIAL else
+                  "rejected" if raw in _REJECTED else "submitted")
         ex = result.get("execution") or {}
         return OrderResult(order, _f(ex.get("filledQuantity")),
                            round(_f(ex.get("averageFilledPrice")), 4),
