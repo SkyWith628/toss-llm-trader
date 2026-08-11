@@ -36,11 +36,11 @@ python3 tests/test_smoke.py && python3 tests/test_llm_agent.py   # 테스트
 | `data/` | 가격 저장소(as-of 조회) + 합성/yfinance 로더 |
 | `strategy/` | 전략 인터페이스 + 모멘텀 베이스라인 + **`llm_agent/`** (Claude 에이전트·메모리·회고·캐싱) |
 | `risk/` | 얇은 안전판(잔고·유효성·$100 한도만, 판단은 LLM 전권) |
-| `execution/` | 브로커 추상 + 모의 브로커 + 리밸런서 (← TossBroker 추가 예정) |
+| `execution/` | 브로커 추상 + 모의 브로커 + 리밸런서 + **`toss_broker.py`**(토스 REST 실거래) |
 | `experiment/` | 원장(JSONL) · 성과지표 · Buy&Hold 대조군 |
 
 ## 로드맵
 1. ✅ **LLM 에이전트 전략** (`strategy/llm_agent/`) — tool-calling 결정 · 메모리·회고 · 캐싱
-2. **TossBroker** (`execution/toss_broker.py`) — 토스 Open API REST 연동
+2. ✅ **TossBroker** (`execution/toss_broker.py`) — 토스 Open API REST 연동(OAuth2·시세·잔고·주문). 실스펙 정합·단위테스트 완료, **실키 연동 검증 대기**. 기본 dry-run(실주문은 `TRADING_MODE=live`).
 3. **Forward 페이퍼 테스트** — 실시간 모의 2~4주, Buy&Hold 대비 측정
 4. (선택) 실계좌 $100 — 검증 통과 후
