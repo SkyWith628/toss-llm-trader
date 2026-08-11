@@ -110,6 +110,21 @@ def test_rebalance_accounts_for_commission():
     assert total <= 100.0 + 1e-6                  # 슬리피지+수수료 포함 실제 소요 <= 현금
 
 
+def test_cost_model_fixed_fee_reduces_sizing():
+    """고정 수수료가 매수 사이징에 실제로 반영돼야(설정만 하고 무시하면 안 됨)."""
+    from src.core.types import Action, Signal
+    from src.execution.costs import CostModel
+    from src.execution.rebalance import signals_to_orders
+    pf = Portfolio(cash=100.0)
+    prices = {"AAA": 40.0}
+    sig = [Signal("AAA", Action.BUY, 1.0)]
+    with_fee = signals_to_orders(sig, pf, prices, cost=CostModel(slippage=0.0005, fixed_fee=5.0))
+    no_fee = signals_to_orders(sig, pf, prices, cost=CostModel(slippage=0.0005))
+    assert with_fee[0].quantity < no_fee[0].quantity          # 현금에서 $5 빠져 덜 산다
+    cm = CostModel(slippage=0.0005, fixed_fee=5.0)
+    assert cm.buy_cost(with_fee[0].quantity, 40.0) <= 100.0 + 1e-6   # 고정비 포함 <= 현금
+
+
 def test_no_lookahead_in_history():
     """history_until은 미래 데이터를 절대 포함하지 않아야 한다."""
     from src.data.synthetic import make_synthetic_store

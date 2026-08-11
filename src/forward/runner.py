@@ -16,11 +16,13 @@ from datetime import datetime
 
 from src.core.types import Action, Side, Signal
 from src.data.storage import PriceStore
+from src.execution.costs import CostModel
 from src.execution.paper_broker import PaperBroker
 from src.execution.rebalance import signals_to_orders
 from src.experiment.metrics import compute_metrics
 from src.risk.guardrail import Guardrail
 from src.strategy.base import Strategy
+from src.forward.experiment_portfolio import ExperimentLedgerError
 from src.forward.state import ForwardState
 
 
@@ -114,9 +116,13 @@ def run_once(
     snapshot = store.snapshot(date, lookback=cfg.lookback + 5)
 
     exp = state.experiment   # 실험 장부(단일 모델). 페이퍼는 protected_positions={}.
+    # 리밸런서·브로커가 공유하는 비용 모델(슬리피지+비례+고정수수료).
+    cost = CostModel(slippage=cfg.slippage, commission_rate=cfg.commission_rate,
+                     fixed_fee=cfg.fixed_fee)
     # 페이퍼 브로커는 '체결 시뮬레이터' — 실험 장부는 실제 체결값으로 갱신한다(apply_buy/sell).
     broker = PaperBroker(starting_cash=exp.cash, slippage=cfg.slippage,
-                         commission_rate=cfg.commission_rate, min_notional=cfg.min_trade)
+                         commission_rate=cfg.commission_rate,
+                         commission_per_trade=cfg.fixed_fee, min_notional=cfg.min_trade)
     broker.portfolio = exp.to_portfolio()
     broker.set_prices(prices)
 
@@ -126,30 +132,35 @@ def run_once(
     # --- 1) 직전 거래일의 결정(pending)을 '오늘' 체결 (시점누수 방지) ---
     # 당일 종가로 결정하고 당일 종가에 체결하는 건 실현 불가능한 가정이다. 그래서 어제 내린
     # 결정을 오늘 가격에 집행한다. 첫 실행엔 pending이 없어 매매가 없다(전량 현금).
+    # 실험이 중단 상태(대사 필요/halted)면 어떤 신규 주문도 내지 않는다(fail-closed).
     pending = _signals_from_dicts(state.pending_signals, date)
-    orders = signals_to_orders(pending, broker.get_portfolio(), prices,
-                               cfg.min_trade, slippage=cfg.slippage,
-                               commission_rate=cfg.commission_rate)
+    orders = (signals_to_orders(pending, broker.get_portfolio(), prices, cfg.min_trade, cost=cost)
+              if exp.can_trade else [])
 
     fills = []
-    for order in orders:
-        decision = guardrail.check(order, broker.get_portfolio(), prices)
-        if not decision.ok:
+    try:
+        for order in orders:
+            decision = guardrail.check(order, broker.get_portfolio(), prices)
+            if not decision.ok:
+                fills.append({"symbol": order.symbol, "side": order.side.value,
+                              "status": "blocked", "reason": decision.reason})
+                continue
+            result = broker.place_order(decision.order, when=date)
+            if result.status == "filled":   # 실체결 기반 장부 갱신(손익·수수료 추적)
+                if order.side is Side.BUY:
+                    exp.apply_buy(order.symbol, result.filled_qty,
+                                  result.fill_price, result.commission)
+                else:
+                    exp.apply_sell(order.symbol, result.filled_qty,
+                                   result.fill_price, result.commission)
             fills.append({"symbol": order.symbol, "side": order.side.value,
-                          "status": "blocked", "reason": decision.reason})
-            continue
-        result = broker.place_order(decision.order, when=date)
-        if result.status == "filled":   # 실체결 기반 장부 갱신(손익·수수료 추적)
-            if order.side is Side.BUY:
-                exp.apply_buy(order.symbol, result.filled_qty,
-                              result.fill_price, result.commission)
-            else:
-                exp.apply_sell(order.symbol, result.filled_qty,
-                               result.fill_price, result.commission)
-        fills.append({"symbol": order.symbol, "side": order.side.value,
-                      "qty": round(order.quantity, 6), "status": result.status,
-                      "fill": result.fill_price, "commission": result.commission,
-                      "reason": order.reason})
+                          "qty": round(order.quantity, 6), "status": result.status,
+                          "fill": result.fill_price, "commission": result.commission,
+                          "reason": order.reason})
+    except ExperimentLedgerError:
+        # 불변식 위반으로 장부가 중단 상태가 됨 → 그 상태·부분 체결분을 우선 영속화한 뒤 재발생.
+        state.save(cfg.state_path)
+        raise
 
     # --- 2) 측정: 오늘 종가로 실험 NAV vs Buy&Hold(첫 실행에 앵커 고정) ---
     state.ensure_bh_anchor(prices)

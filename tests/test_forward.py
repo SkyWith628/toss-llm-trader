@@ -184,6 +184,41 @@ def test_config_change_detected():
         assert raised
 
 
+def test_runner_skips_orders_when_not_tradeable():
+    """실험이 중단 상태면 어제 결정이 있어도 runner가 신규 주문을 내지 않아야(fail-closed)."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(d)
+        store = make_synthetic_store(cfg.symbols, days=30, seed=21)
+        strat = FixedStrategy({"AAA": 0.5})
+        run_once(cfg, store=store, today=store.dates[10], strategy=strat)  # day1: pending 저장
+        # 실험을 중단 상태로 만들고 저장
+        st = ForwardState.load_or_init(cfg.state_path, budget=100.0, symbols=cfg.symbols,
+                                       source="synthetic", strategy="momentum", model="-")
+        st.experiment.require_reconciliation("테스트 중단")
+        st.save(cfg.state_path)
+        # day2: 중단 상태 → 어제 결정 체결 안 됨
+        r2 = run_once(cfg, store=store, today=store.dates[11], strategy=strat)
+        assert r2["fills"] == []
+        st2 = ForwardState.load_or_init(cfg.state_path, budget=100.0, symbols=cfg.symbols,
+                                        source="synthetic", strategy="momentum", model="-")
+        assert "AAA" not in st2.experiment.experiment_positions   # 매수 안 됨
+
+
+def test_schema_version_mismatch_fails_closed():
+    """현재와 다른 스키마 버전은 변환 없이 통과시키지 않아야(schema_version=1도 거부)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "state.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"schema_version":1,"budget":100.0,"symbols":["AAA"]}')
+        try:
+            ForwardState.load_or_init(path, budget=100.0, symbols=["AAA"],
+                                      source="synthetic", strategy="momentum", model="-")
+            raised = False
+        except ValueError as e:
+            raised = "버전" in str(e)
+        assert raised
+
+
 def test_old_schema_fails_closed():
     """schema_version 없는 구버전 상태 파일은 친절히 fail-closed(KeyError 대신)."""
     with tempfile.TemporaryDirectory() as d:

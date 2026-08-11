@@ -742,6 +742,258 @@ live 안전 운용               불가
 
 ---
 
+## Codex 3차 재검토 피드백 (2026-08-12)
+
+### 총평
+
+2차 재검토의 빠른 정정 항목은 대체로 정확하게 반영됐으며, 현재 전체 테스트와 `compileall`은 통과한다.
+
+다음 항목은 해결된 것으로 확인했다.
+
+- `PARTIAL_FILLED`를 `partially_filled`로 분리
+- 부분 체결에서 첫 응답만 보고 폴링을 종료하지 않음
+- 주문 상세 조회에 `X-Tossinvest-Account` 계좌 헤더 추가
+- 실제 매수 체결 비용이 실험 현금을 초과하면 fail-closed
+- 상태 스키마 버전 도입
+- 결과에 영향을 주는 canonical 설정 저장 및 재실행 비교
+- 설정 변경 시 동일 성과 곡선 재사용 차단
+- 구버전 상태에 대한 `KeyError` 대신 설명 가능한 오류
+
+그러나 중단 상태에서도 `CarveOutBroker`가 주문을 전송할 수 있는 P0 결함이 새로 확인됐다. 또한 fail-closed 상태의 영속성, 고정 수수료 전달, 열린 주문의 재시작 복구가 아직 미완료이므로 live 활성화는 불가하다.
+
+### [P0] `reconciliation_required` 또는 `halted` 상태에서도 주문 전송 가능
+
+현재 `CarveOutBroker.place_and_settle()`은 `ExperimentPortfolio.can_trade`를 확인하지 않는다.
+
+따라서 다음과 같은 상태에서도 실험 현금과 수량 조건만 맞으면 내부 TossBroker로 주문이 전달될 수 있다.
+
+```python
+exp.require_reconciliation("계좌 수량 불일치")
+assert not exp.can_trade
+
+carveout.place_and_settle(order, client_order_id="...")
+# 현재 구현에서는 주문 전송 가능
+```
+
+이는 “대사 실패 또는 안전 불변식 위반 시 모든 신규 주문을 중단한다”는 핵심 요구사항을 위반한다.
+
+`place_and_settle()` 진입 직후 다음 검사를 수행해야 한다.
+
+```python
+if not self.exp.can_trade:
+    return self._reject(
+        order,
+        when,
+        f"실험 거래 중단 상태: {self.exp.status} — {self.exp.status_reason}",
+    )
+```
+
+필수 테스트:
+
+1. `status == reconciliation_required`이면 주문이 거부된다.
+2. `status == halted`이면 주문이 거부된다.
+3. 두 경우 모두 내부 브로커의 `place_order()` 호출 횟수는 0이다.
+4. 거부 결과에 상태와 중단 사유가 포함된다.
+5. 상태를 명시적으로 복구하기 전까지 재시도해도 계속 거부된다.
+
+### [P1] fail-closed 예외 발생 후 상태가 저장되지 않을 수 있음
+
+`ExperimentPortfolio.apply_buy()`와 `apply_sell()`은 불변식 위반 시 다음 순서로 동작한다.
+
+```text
+1. 메모리의 상태를 reconciliation_required로 변경
+2. status_reason/status_changed_at 설정
+3. ExperimentLedgerError 발생
+```
+
+그러나 현재 Forward runner는 이 예외를 처리하지 않으며 `state.save()`는 이후 단계에서 실행된다.
+
+위험 시나리오:
+
+```text
+실제 체결 발생
+→ 장부 반영 중 안전 불변식 위반
+→ 메모리에서 reconciliation_required
+→ 예외로 run_once 종료
+→ state.json 저장 안 됨
+→ 다음 프로세스는 이전 active 상태를 로드
+```
+
+Runner 또는 live 실행 계층에서 `ExperimentLedgerError`를 잡아 중단 상태와 체결 사실을 우선 영속화한 뒤 종료해야 한다.
+
+최소 구현:
+
+```python
+try:
+    apply_fill(...)
+except ExperimentLedgerError:
+    state.save(cfg.state_path)
+    raise
+```
+
+다만 실주문 환경에서는 state 파일 저장만으로 주문·체결·장부의 원자성을 완전히 보장하지 못하므로, 열린 주문 저널 또는 SQLite 트랜잭션 도입이 권장된다.
+
+필수 테스트:
+
+- 실제 비용 초과로 `apply_buy()`가 예외를 던진 뒤 상태 파일을 다시 로드해도 `reconciliation_required`가 유지된다.
+- 초과 매도 체결 예외 후에도 상태와 사유가 유지된다.
+- 예외 후 다음 실행은 어떤 주문도 전송하지 않는다.
+
+### [P1] `fixed_fee` 설정이 실제 비용에 전달되지 않음
+
+`ForwardConfig`와 canonical 설정에는 `fixed_fee`가 존재하지만 현재 Forward runner는 이를 다음 경로에 전달하지 않는다.
+
+- `PaperBroker.commission_per_trade`
+- 리밸런서가 사용하는 `CostModel.fixed_fee`
+
+따라서 사용자는 고정 수수료를 설정했다고 생각하지만 실제 주문 사이징·체결·성과 계산에는 반영되지 않는다.
+
+권장 구현:
+
+```python
+cost = CostModel(
+    slippage=cfg.slippage,
+    commission_rate=cfg.commission_rate,
+    fixed_fee=cfg.fixed_fee,
+)
+
+broker = PaperBroker(
+    starting_cash=exp.cash,
+    slippage=cfg.slippage,
+    commission_rate=cfg.commission_rate,
+    commission_per_trade=cfg.fixed_fee,
+    min_notional=cfg.min_trade,
+)
+
+orders = signals_to_orders(
+    pending,
+    broker.get_portfolio(),
+    prices,
+    cfg.min_trade,
+    cost=cost,
+)
+```
+
+필수 테스트:
+
+- 고정 수수료가 두 건 이상의 매수 사이징에 반영된다.
+- 리밸런서 예상 비용과 PaperBroker 실제 차감액이 일치한다.
+- 고정 수수료 때문에 마지막 주문이 현금을 초과하지 않는다.
+- `fees_paid`와 성과 곡선에 고정 수수료가 반영된다.
+
+### [P1] 부분 체결의 상태 분리는 해결됐지만 재시작 복구는 미완료
+
+부분 체결을 최종 `filled`로 오인하던 문제는 해결됐다. `CarveOutBroker`도 부분 체결 시 폴링을 계속한다.
+
+그러나 폴링 횟수가 끝난 뒤 다음 정보가 상태에 저장되지 않는다.
+
+- `client_order_id`
+- broker `order_id`
+- 요청 수량
+- 누적 체결 수량
+- 이미 실험 장부에 반영한 수량
+- 미체결 잔량
+- 예약 현금
+- 예약 매도 수량
+- 마지막 확인 상태와 시각
+
+따라서 프로세스 재시작 후 잔여 주문의 추가 체결분을 증분 정산할 수 없다. 2차 검토에서 제안한 `open_orders` 영속 모델이 여전히 필요하다.
+
+### [P2] 스키마 버전 1을 변환 없이 통과시킬 수 있음
+
+현재 상태 로더는 다음 경우만 거부한다.
+
+```python
+if ver > SCHEMA_VERSION:
+    raise ValueError(...)
+```
+
+이 구조에서는 `schema_version=1` 파일이 통과한 뒤 `experiment` 등 새로운 필드를 읽는 과정에서 실패할 수 있다.
+
+마이그레이션 함수가 아직 없다면 현재 버전과 정확히 일치하는 경우만 허용해야 한다.
+
+```python
+if ver != SCHEMA_VERSION:
+    raise ValueError(
+        f"지원하지 않는 상태 버전 {ver}. 새 --state-dir을 사용하거나 명시적으로 마이그레이션하세요."
+    )
+```
+
+향후 마이그레이션을 지원할 경우 다음처럼 버전별 변환 함수를 명시적으로 둔다.
+
+```python
+if ver == 1:
+    data = migrate_v1_to_v2(data)
+elif ver != SCHEMA_VERSION:
+    fail_closed()
+```
+
+실계좌의 보호 기준선은 마이그레이션 과정에서 자동 추정하지 않는다.
+
+### [P2] state와 equity 로그의 원자성 문제는 남아 있음
+
+Runner는 `state.json`을 먼저 저장한 후 `equity.jsonl`을 append한다. 두 작업 사이에서 종료되면 state에는 해당 날짜가 실행 완료로 남지만 equity 행은 누락된다. 다음 실행은 같은 날짜 중복 방지에 걸려 누락을 복구하지 못한다.
+
+live 주문·체결 상태까지 통합하기 전에 다음 중 하나가 필요하다.
+
+- SQLite 트랜잭션
+- 일별 write-ahead journal 및 완료 마커
+- 상태에서 누락된 equity 행을 재구성할 수 있는 결정론적 복구 절차
+
+### 3차 검증 결과
+
+현재 환경에서 직접 실행한 결과:
+
+```text
+test_carveout.py          통과
+test_carveout_broker.py   통과
+test_forward.py           통과
+test_llm_agent.py         통과
+test_smoke.py             통과
+test_toss_broker.py       통과
+compileall                통과
+```
+
+현재 테스트에는 `exp.can_trade == False`인 상태에서 `CarveOutBroker`가 실제 주문 전송을 차단하는 시나리오가 없다. 따라서 전체 테스트 통과가 P0 불변식을 보증하지는 않는다.
+
+### 갱신된 구현 우선순위
+
+1. `CarveOutBroker.place_and_settle()`에서 `exp.can_trade`를 최우선 검사한다.
+2. `reconciliation_required`와 `halted` 상태의 주문 차단 테스트를 추가한다.
+3. `ExperimentLedgerError` 발생 시 상태를 즉시 영속화하고 다음 실행도 fail-closed 되는지 테스트한다.
+4. `fixed_fee`를 공통 `CostModel`과 `PaperBroker`에 전달한다.
+5. 고정 수수료가 주문 사이징·체결·성과에 반영되는 통합 테스트를 추가한다.
+6. `ForwardState.open_orders`와 예약 현금·예약 매도 수량을 구현한다.
+7. 주문 전송 전에 주문 의도와 안정적인 멱등 키를 영속화한다.
+8. 부분 체결의 누적값과 이미 반영한 체결량의 차이만 장부에 반영한다.
+9. 프로세스 재시작 후 열린 주문을 복원하고 정산하는 테스트를 추가한다.
+10. 스키마 버전이 정확히 일치하지 않으면 명시적 마이그레이션 없이 fail-closed 한다.
+11. 주문·체결·state·equity 기록의 복구 프로토콜을 구현한다.
+12. 주문 전후 실계좌 대사와 보호 기준선 사용자 확인 절차를 연결한다.
+13. 모든 완료 조건이 충족된 뒤에만 live 경로를 활성화한다.
+
+### 3차 검토 시점 완료도
+
+```text
+페이퍼 운용                    가능
+NAV 복리 재투자                가능
+백테스트 시점 누수             해결
+공통 비례수수료·슬리피지 모델   완료
+고정 수수료 실행 반영           미완료
+카브아웃 순수 장부             양호
+부분 체결 상태 분리             완료
+부분 체결 잔량·재시작 복구       미완료
+중단 상태의 실주문 차단         P0 결함
+fail-closed 상태 영속           불완전
+열린 주문·예약 자산             미완료
+실계좌 대사 runner 연결         미완료
+보호 기준선 초기화              미완료
+state/equity 원자성             미완료
+live 안전 운용                  불가
+```
+
+---
+
 ## Codex 피드백 반영 (2026-08-12, Claude)
 
 재검토 8개 항목을 코드와 대조 검증 후 조치. 1건은 이미 반영돼 있었음.
@@ -808,3 +1060,37 @@ live 활성화는 위 증분3~5 + 완료 조건 충족 전까지 금지(변동 �
 - runner의 live 경로 + 주문 전후 `reconcile` 배선(증분3b), 보호분 기준선 초기화(증분4).
 
 전체 테스트(6파일)+`compileall` 통과. live는 3b~4 완료 전까지 계속 금지.
+
+---
+
+## Codex 3차 피드백 반영 (2026-08-12, Claude)
+
+6개 지적을 grep으로 전부 검증 — **사실관계는 6개 다 정확(스테일 없음)**. 다만 심각도는 현재 상태
+기준으로 과대: **`CarveOutBroker`가 어떤 실행 경로에도 배선돼 있지 않고(runner는 PaperBroker만,
+live 분기 없음), paper 흐름은 fail-closed 예외를 구조적으로 못 일으키며(PaperBroker가 현금·보유
+초과를 선차단), `fixed_fee`는 CLI 노출이 없어 항상 0**이다. 즉 셋 다 "오늘 돌아가는 실험엔 무영향,
+아직 없는 live 경로의 선결 조건". 그럼에도 값싸고 옳으므로 선반영:
+
+### 이번에 처리 (live 전 방어, 빠른 정정)
+
+- ✅ **[P0] 중단 상태 주문 차단** — `CarveOutBroker.place_and_settle` 진입 즉시 `exp.can_trade`
+  검사(대사필요/halted면 전송 前 거부). **Codex가 놓친 대칭 결함까지**: runner 실행 루프도
+  `can_trade`가 아니면 신규 주문을 내지 않게 게이트. 테스트: 브로커(대사필요·halted·재시도 지속
+  거부·전송 0), runner(중단 상태 day에서 어제 결정 무체결).
+- ✅ **[P1] fail-closed 상태 영속** — runner의 체결 루프를 `try/except ExperimentLedgerError`로
+  감싸 예외 시 `state.save` 후 재발생(중단 상태·부분 체결분 우선 영속). '다음 실행 무주문'은 위
+  can_trade 게이트가 보장.
+- ✅ **[P1] `fixed_fee` 배선** — runner가 `CostModel(...,fixed_fee)`를 리밸런서에, `commission_
+  per_trade=fixed_fee`를 PaperBroker에 전달(`commission_rate`와 대칭). 고정비 반영 사이징 테스트.
+- ✅ **[P2] 스키마 정확일치** — `ver != SCHEMA_VERSION`이면 fail-closed(마이그레이션 함수 생기기
+  전 `=1` 등 중간 버전 무변환 통과 금지). 테스트 추가.
+
+### 증분3b로 (남음)
+
+- **[P1] open_orders 영속 + 재시작 복구** — client_order_id·broker_order_id·requested/누적/반영
+  수량·reserved cash/qty·last status를 **전송 前** 저장, 재시작 후 재조회·증분 정산·중복주문 없음
+  테스트. (2차·3차에서 재확인)
+- **[P2] state·order·fill·equity 저장 원자성** — 완료마커/WAL/SQLite.
+- runner live 경로 + 주문 전후 `reconcile` 배선, 보호분 기준선 초기화(증분4).
+
+전체 테스트(6파일)+`compileall` 통과. live 계속 금지.

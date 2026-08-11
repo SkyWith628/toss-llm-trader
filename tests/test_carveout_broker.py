@@ -118,6 +118,29 @@ def test_idempotent_retry_reuses_order():
     assert inner.seq == 1                            # 같은 멱등키 → orderId 1개만(중복주문 방지)
 
 
+def test_blocked_when_reconciliation_required():
+    """대사 필요 상태면 조건이 맞아도 주문을 전송하지 않아야(Codex P0, 최우선 게이트)."""
+    inner = FakeInner(price=10.0)
+    exp = _exp(cash=100.0)
+    exp.require_reconciliation("계좌 수량 불일치")
+    c = _carve(inner, exp)
+    r = c.place_and_settle(Order("AAPL", Side.BUY, 0.5), client_order_id="k")
+    assert r.status == "rejected" and "중단" in r.note
+    assert inner.placed == []                 # 내부 브로커로 전송조차 안 됨
+    # 상태를 복구하기 전엔 재시도해도 계속 거부
+    r2 = c.place_and_settle(Order("AAPL", Side.BUY, 0.5), client_order_id="k")
+    assert r2.status == "rejected" and inner.placed == []
+
+
+def test_blocked_when_halted():
+    inner = FakeInner(price=10.0)
+    exp = _exp(cash=100.0)
+    exp.halt("긴급 중단")
+    c = _carve(inner, exp)
+    r = c.place_and_settle(Order("AAPL", Side.BUY, 0.5), client_order_id="k")
+    assert r.status == "rejected" and inner.placed == []
+
+
 def test_dry_run_inner_not_settled():
     inner = FakeInner(price=10.0, live=False)        # 내부가 paper(dry-run)
     c = _carve(inner, _exp(cash=100.0))

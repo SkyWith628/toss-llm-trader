@@ -62,6 +62,10 @@ class CarveOutBroker:
         client_order_id: 이 '의도한 주문'의 멱등키. 재시도 시 같은 값을 넘기면 중복주문 방지.
         """
         when = when or datetime.now()
+        # 중단 상태(대사 필요/halted)면 어떤 신규 주문도 전송하지 않는다(fail-closed, 최우선).
+        if not self.exp.can_trade:
+            return self._reject(
+                order, when, f"실험 거래 중단({self.exp.status}): {self.exp.status_reason}")
         try:
             prices = self.get_prices()
         except TossApiError as e:

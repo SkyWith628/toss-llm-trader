@@ -68,9 +68,11 @@ class ForwardState:
             if ver is None:
                 raise ValueError(
                     "구버전 상태 형식입니다(schema_version 없음). 리셋하거나 새 --state-dir로 시작하세요.")
-            if ver > SCHEMA_VERSION:
+            if ver != SCHEMA_VERSION:
+                # 마이그레이션 함수가 생기기 전까지는 '정확히 일치'만 허용(변환 없는 통과 금지).
                 raise ValueError(
-                    f"지원하지 않는 상태 버전 {ver}(>{SCHEMA_VERSION}). 최신 코드로 여세요.")
+                    f"지원하지 않는 상태 버전 {ver}(현재 {SCHEMA_VERSION}). 명시적 마이그레이션 없이는 "
+                    f"열지 않습니다 — 새 --state-dir을 쓰세요.")
             exp = ExperimentPortfolio.from_dict(data["experiment"])
             st = cls(
                 budget=data["budget"], symbols=list(data["symbols"]),
