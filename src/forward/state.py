@@ -16,7 +16,8 @@ from dataclasses import dataclass, field
 from src.core.types import Portfolio
 from src.forward.experiment_portfolio import ExperimentPortfolio
 
-SCHEMA_VERSION = 2   # state.json 형식 버전. 구버전(필드 상이)은 로드 시 fail-closed.
+SCHEMA_VERSION = 3   # state.json 형식 버전. 구버전(필드 상이)은 로드 시 fail-closed.
+                     # v3: open_orders(열린주문 장부) 추가 — live 멱등키/부분체결 재시작 복구용.
 
 
 def _config_diff(a: dict, b: dict) -> str:
@@ -45,6 +46,9 @@ class ForwardState:
     # 직전 거래일에 내린 결정 — '오늘' 체결한다(시점누수 방지: 당일종가 신호를 당일 체결하지 않음).
     # 각 항목: {"symbol","action","target_weight","rationale"}
     pending_signals: list[dict] = field(default_factory=list)
+    # live 열린주문 장부 — intent_id -> 열린주문 레코드(order_book.py). 전송 '이전'에 여기에
+    # 기록·영속하고(write-ahead), 재시작 시 미결 주문을 이어받아 중복주문을 막는다. 페이퍼는 {}.
+    open_orders: dict[str, dict] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
     config: dict = field(default_factory=dict)   # 결과에 영향 주는 설정(재실행 시 대조)
 
@@ -84,6 +88,7 @@ class ForwardState:
                 bh_anchor=dict(data.get("bh_anchor") or {}),
                 memory=list(data.get("memory") or []),
                 pending_signals=list(data.get("pending_signals") or []),
+                open_orders=dict(data.get("open_orders") or {}),
                 schema_version=ver, config=dict(data.get("config") or {}))
             if abs(st.budget - budget) > 1e-9 or sorted(st.symbols) != sorted(symbols):
                 raise ValueError(
@@ -112,6 +117,7 @@ class ForwardState:
             "experiment": self.experiment.to_dict() if self.experiment else None,
             "bh_shares": self.bh_shares, "bh_anchor": self.bh_anchor,
             "memory": self.memory, "pending_signals": self.pending_signals,
+            "open_orders": self.open_orders,
         }
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:

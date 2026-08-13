@@ -97,6 +97,16 @@ class CarveOutBroker:
         # --- 비동기 체결 정산 폴링(부분체결이면 filledQuantity만 반영됨) ---
         return self._settle(order_id, order, when)
 
+    def settle_existing(
+        self, order_id: str, order: Order, when: datetime | None = None
+    ) -> OrderResult:
+        """이미 전송된 주문(orderId 보유)을 재조회해 실체결을 회수한다(재시작 복구용).
+
+        프로세스가 전송 후 죽어 장부 반영을 못 했을 때, 새 주문을 보내지 않고 기존 orderId부터
+        폴링한다(스펙 §'상태를 알 수 없으면 새 주문 전에 기존 주문부터 조회'). 전송은 하지 않는다.
+        """
+        return self._settle(order_id, order, when or datetime.now())
+
     def _settle(self, order_id: str, order: Order, when: datetime) -> OrderResult:
         last: OrderResult | None = None
         for i in range(self.poll_attempts):
