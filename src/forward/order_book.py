@@ -39,14 +39,17 @@ def is_terminal(status: str) -> bool:
     return status in _TERMINAL
 
 
-def stable_client_order_id(state_id: str, date_iso: str, symbol: str, side: Side) -> str:
-    """결정론적 멱등키 — 같은 (실험·거래일·종목·방향)이면 재시작 후에도 동일 문자열.
+def stable_client_order_id(state_id: str, date_iso: str, symbol: str,
+                           side: Side, seq: int = 0) -> str:
+    """결정론적 멱등키 — 같은 (실험·거래일·종목·방향·순번)이면 재시작 후에도 동일 문자열.
 
     랜덤 UUID면 재시작 시 새 키가 생겨 브로커가 중복주문을 새 주문으로 접수한다. 결정론적
     키여야 브로커의 clientOrderId dedup이 '같은 의도'를 하나로 묶는다(중복주문 방지의 근간).
+    seq: 같은 거래일에 같은 종목·방향 주문이 둘 이상일 때 의도를 구분(주문분할·--force 대비).
+    주문 목록은 영속된 pending_signals에서 결정론적으로 재생성되므로 순번도 재시작에 안정적.
     """
     side_v = side.value if isinstance(side, Side) else str(side)
-    return f"{state_id}-{date_iso}-{symbol}-{side_v}"
+    return f"{state_id}-{date_iso}-{symbol}-{side_v}-{seq}"
 
 
 def make_intent(

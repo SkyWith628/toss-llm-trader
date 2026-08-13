@@ -34,11 +34,13 @@ class FakeLiveBroker:
     orderId로 dedup(멱등). 완전체결은 실계좌 보유(holdings)에 반영(대사 통과되도록).
     """
 
-    def __init__(self, price=10.0, holdings=None, fill_ratio=1.0, commission=0.0):
+    def __init__(self, price=10.0, holdings=None, fill_ratio=1.0, commission=0.0,
+                 reflect_buy=True):
         self.price = price
         self.holdings = dict(holdings or {})
         self.fill_ratio = fill_ratio
         self.commission = commission
+        self.reflect_buy = reflect_buy   # False면 매수 체결이 계좌 보유에 반영 안 됨(종료 대사 불일치 유발)
         self.seq = 0
         self.key_to_oid: dict[str, str] = {}
         self.orders: dict[str, Order] = {}
@@ -51,7 +53,7 @@ class FakeLiveBroker:
     def _result(self, order, oid, *, reflect_holding):
         filled = order.quantity * self.fill_ratio
         status = "filled" if self.fill_ratio >= 1.0 else "partially_filled"
-        if reflect_holding and order.side is Side.BUY:
+        if reflect_holding and order.side is Side.BUY and self.reflect_buy:
             self.holdings[order.symbol] = self.holdings.get(order.symbol, 0.0) + filled
         return OrderResult(order, filled, self.price, self.commission, status,
                            datetime.now(), oid)
@@ -179,6 +181,51 @@ def test_start_reconcile_failure_blocks_orders():
     assert not exp.can_trade                               # reconciliation_required로 전환
     assert broker.place_calls == []                        # 신규 주문 전송 0
     assert any(f.get("status") == "halted" for f in fills)
+
+
+# ---------- 리뷰 #4: 지연 SELL 체결이 시작 대사를 오탐 halt하지 않아야 ----------
+def test_delayed_sell_fill_recovered_before_reconcile():
+    """전송 완료된 SELL이 실행 사이 체결돼 계좌가 줄어도, 조회 복구가 대사보다 먼저라 정상 처리."""
+    exp = ExperimentPortfolio(
+        initial_capital=100.0, cash=50.0,
+        experiment_positions={"AAPL": ExperimentPosition("AAPL", 0.5, 10.0)})
+    cfg, state, guardrail, cost = _ctx(exp)
+    coid = ob.stable_client_order_id("livewire", _DATE_ISO, "AAPL", Side.SELL)
+    rec = ob.make_intent(coid, Order("AAPL", Side.SELL, 0.5), reserved_sell_qty=0.5)
+    rec["broker_order_id"] = "ord-9"          # 전송 완료(orderId 있음)
+    rec["status"] = "submitted"
+    state.open_orders[coid] = rec
+    state.last_account_snapshot = {"AAPL": 0.5}
+    broker = FakeLiveBroker(price=10.0, fill_ratio=1.0, holdings={"AAPL": 0.0})  # 그 SELL이 체결됨
+
+    fills, _ = _run(cfg, state, exp, [], guardrail, cost, broker)
+
+    assert exp.can_trade                                  # 오탐 halt 없음(#4)
+    assert exp.experiment_positions.get("AAPL") is None   # 매도가 장부에도 정산됨(0)
+    assert broker.place_calls == []                        # 조회 복구만(재전송 없음)
+    assert not any(f.get("status") == "halted" for f in fills)
+
+
+# ---------- 리뷰 #6: 같은 날 같은 방향 다중 주문은 서로 다른 멱등키 ----------
+def test_duplicate_same_side_orders_get_distinct_keys():
+    exp = ExperimentPortfolio(initial_capital=100.0, cash=100.0)
+    cfg, state, guardrail, cost = _ctx(exp)
+    broker = FakeLiveBroker(price=10.0, fill_ratio=1.0)
+    orders = [Order("AAPL", Side.BUY, 0.2), Order("AAPL", Side.BUY, 0.3)]
+    _run(cfg, state, exp, orders, guardrail, cost, broker)
+    assert len(set(broker.place_calls)) == 2   # 두 주문이 서로 다른 키(하나가 다른 하나를 덮지 않음)
+    assert broker.seq == 2                       # 각각 별도 orderId(둘째 주문 유실 없음)
+
+
+# ---------- 리뷰 #5: 종료 대사 실패가 결과에 드러나야 ----------
+def test_end_reconcile_failure_surfaced():
+    exp = ExperimentPortfolio(initial_capital=100.0, cash=100.0)
+    cfg, state, guardrail, cost = _ctx(exp)
+    broker = FakeLiveBroker(price=10.0, fill_ratio=1.0, reflect_buy=False)  # 매수가 계좌에 안 잡힘
+    fills, _ = _run(cfg, state, exp, [Order("AAPL", Side.BUY, 0.5)], guardrail, cost, broker)
+
+    assert not exp.can_trade                                          # 종료 대사가 상태를 중단으로 전환
+    assert any("종료 대사 실패" in str(f.get("reason", "")) for f in fills)   # 사유가 fills에 노출
 
 
 if __name__ == "__main__":

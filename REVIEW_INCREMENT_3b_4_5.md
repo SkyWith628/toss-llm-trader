@@ -101,7 +101,25 @@ start_holdings = broker.account_holdings()          # 시작 스냅샷(대사·�
 
 ---
 
-## 6. Codex 재검토 요청 포인트 · 알려진 한계
+## 5-1. 1차 리뷰 반영 (해결 완료)
+
+리뷰에서 지적된 아래 3건을 이 브랜치에서 수정하고 회귀 테스트를 추가했다(`test_live_wiring`).
+
+- ✅ **#4 지연 SELL → 시작 대사 오탐 halt (Critical)**: live 순서를 재정렬해 **orderId를 아는 열린
+  주문의 조회 복구(전송 없음)를 시작 대사보다 먼저** 수행(`_recover_known_orders`) → 지연 SELL을
+  장부에 반영한 뒤 대사. 재전송(orderId 미상)은 대사·감지 통과 후(`_recover_resend_orders`, ④).
+  테스트 `test_delayed_sell_fill_recovered_before_reconcile`. (원 §6-3의 재전송 감지 오탐도 함께 해소.)
+- ✅ **#5 종료 대사 실패 미노출 (Warning)**: 종료 대사 반환을 확인해 실패 시 `fills`에 `halted` 행을
+  남기고 `run_once` 반환에 `status`를 추가. 테스트 `test_end_reconcile_failure_surfaced`.
+- ✅ **#6 멱등키 충돌 (Warning)**: `stable_client_order_id`에 순번(`seq`) 추가, 신규 주문 루프가
+  (종목,방향)별로 순번을 매겨 같은 날 같은 방향 다중 주문이 서로 다른 키를 갖게 함. 테스트
+  `test_duplicate_same_side_orders_get_distinct_keys`.
+
+전체 9개 테스트 파일 통과(python3.12). 아래 §6은 남은 판단/한계.
+
+## 6. Codex 재검토 요청 포인트 · 알려진 한계 (남은 판단)
+
+> 1차 리뷰의 #4·#5·#6과 원 §6-3(재전송 감지 오탐)은 해결되어 §5-1로 이동. 아래는 미해결 항목.
 
 1. **스키마 마이그레이션 부재** — `SCHEMA_VERSION`을 2→4로 올렸고, 정확 일치 아니면 fail-closed
    (`state.py`). 기존 페이퍼 상태(v2)는 새 `--state-dir`을 써야 한다. 마이그레이션 함수는 미도입.
@@ -111,22 +129,17 @@ start_holdings = broker.account_holdings()          # 시작 스냅샷(대사·�
    그 사이 사망 시 상태엔 실행됨/중복방지가 남지만 성과 로그 행이 빠질 수 있음. 실주문·열린주문까지
    얽히면 파일 2개 쓰기 순서만으로 복구 보장 어려움 → SQLite/저널은 다음 증분으로 연기.
 
-3. **재전송 복구의 감지 델타 제외로 인한 드문 false-positive halt** — 전송 성공 후 orderId 저장 전
-   사망한 주문이 실행 사이에 체결됐다면, 그 체결은 `start_holdings`엔 반영되나 감지 델타엔
-   빠진다(재전송 경로 제외) → 잔여로 잡혀 halt. **fail-closed(안전 방향)** 이나 드물게 오탐. 이 트레이드
-   오프가 수용 가능한지, 아니면 재전송 후 체결분을 정밀 반영할지 판단 요청.
-
-4. **현금성 사건 미감지** — 배당금 입금·환전 손익은 계좌 **현금** 조회가 필요해 이번 감지 범위 밖
+3. **현금성 사건 미감지** — 배당금 입금·환전 손익은 계좌 **현금** 조회가 필요해 이번 감지 범위 밖
    (브로커 보유 수량만 사용). 배당 '재투자'로 수량이 늘면 잡히지만, 현금 배당은 안 잡힘.
 
-5. **guardrail 예산 인자** — `Guardrail(budget=...)`은 "참고용"이고 NAV 복리 재투자를 막지 않는다고
+4. **guardrail 예산 인자** — `Guardrail(budget=...)`은 "참고용"이고 NAV 복리 재투자를 막지 않는다고
    주석돼 있으나, NAV>budget 상황에서 정상 주문을 오차단하지 않는지 재확인 요청(리밸런서는
    `exp.to_portfolio()`의 NAV로 사이징).
 
-6. **mode는 canonical config에서 제외** — 같은 `--state-dir`에서 paper↔live 전환을 config 대조로
+5. **mode는 canonical config에서 제외** — 같은 `--state-dir`에서 paper↔live 전환을 config 대조로
    막지 않는다(체결 성격이 다른 곡선 혼입 가능). 의도적 라우팅 선택이나, 막아야 할지 판단 요청.
 
-7. **Decimal 미도입** — 금액·수량 여전히 float. 통화 정밀도 관점 비용/효익 판단 요청.
+6. **Decimal 미도입** — 금액·수량 여전히 float. 통화 정밀도 관점 비용/효익 판단 요청.
 
 ---
 
@@ -149,5 +162,8 @@ python3.12 tests/test_events.py        # 증분5 감지
 충족: 보호분 주문 제외 · 실험분 초과매도 차단 · NAV 복리 · 외부현금 차단 · 수수료 포함 사이징 ·
 실체결 기반 장부 · 주문 전후 대사·fail-closed 테스트 · 재시도 멱등성·부분체결 테스트.
 
-남음: **P2 저장 원자성** · **Decimal** · **현금성 사건 대응** · **실키 연동 검증(IP allowlist)**.
+1차 리뷰 반영(§5-1): 지연 SELL 복구 순서 · 종료 대사 실패 로깅 · 멱등키 충돌 방지 완료.
+
+남음: **스키마 마이그레이션** · **P2 저장 원자성** · **Decimal** · **현금성 사건 대응** ·
+**실키 연동 검증(IP allowlist)**.
 → 위가 정리되기 전까지 실주문은 `.env TRADING_MODE=live` + 전용 $100 계좌에서만.

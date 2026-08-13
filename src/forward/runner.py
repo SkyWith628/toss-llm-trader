@@ -194,7 +194,7 @@ def run_once(
         "strategy_return": round(strat_value / cfg.budget - 1.0, 4),
         "bh_return": round(bh_value / cfg.budget - 1.0, 4),
         "cash": round(exp.cash, 4), "realized_pnl": round(exp.realized_pnl, 4),
-        "commission": round(commission_total, 6), "fills": fills,
+        "commission": round(commission_total, 6), "status": exp.status, "fills": fills,
     }
 
 
@@ -244,30 +244,35 @@ def _execute_paper(cfg, state, exp, orders, guardrail, prices, date, cost):
 def _execute_live(cfg, state, exp, orders, guardrail, prices, date, date_iso, cost, broker):
     """실계좌 집행 — 전후 대사 + 열린주문 복구 + 외부 사건 감지 + 부분체결 델타 정산.
 
-    순서: ①시작 대사 → ②미결 열린주문 복구(재시작) → ③외부 사건 감지(증분5) → ④신규 주문(전송 前
-    영속·정산) → ⑤종료 대사·스냅샷 갱신. 어느 단계든 대사 실패/사건/장부 중단이면 신규 주문을
-    멈춘다(fail-closed). 반환: (fills, 누적 수수료).
+    순서: ①조회 복구(전송 없음) → ②시작 대사 → ③외부 사건 감지 → ④재전송 복구 → ⑤신규 주문
+    (전송 前 영속·정산) → ⑥종료 대사·스냅샷 갱신. 어느 단계든 대사 실패/사건/장부 중단이면 신규
+    주문을 멈춘다(fail-closed). 반환: (fills, 누적 수수료).
+
+    ①을 대사보다 앞에 둔 이유(리뷰 #4): 지난 실행이 남긴 SELL 열린주문이 실행 사이에 체결되면
+    실계좌 보유가 먼저 줄어든다. 대사를 먼저 하면 아직 장부에 반영 안 된 그 매도를 '실계좌<보호+
+    실험'으로 오탐해 정상 매도를 halt한다. 그래서 orderId를 아는(전송 완료) 열린주문을 '조회만'으로
+    먼저 정산해 장부를 최신화한 뒤 대사한다. 재전송(orderId 미상)은 대사·감지를 통과한 ④에서만.
     """
     fills: list[dict] = []
     commission_total = 0.0
     start_holdings = broker.account_holdings()   # 이번 실행 시작 시점 실계좌 보유(대사·사건감지 공용)
 
-    # ① 시작 대사: 실계좌 보유가 보호분+실험분 미만이면(수동매매/출금 의심) 즉시 중단.
+    # ① 조회 복구(전송 없음): orderId를 아는 열린주문의 지연체결을 장부에 먼저 반영(#4).
+    #    experiment_delta = 그 사이 실험이 만든 순 보유 변화 → ③ 사건감지의 '설명 가능분'으로 뺀다.
+    try:
+        rec_commission, experiment_delta = _recover_known_orders(cfg, state, exp, broker, fills)
+        commission_total += rec_commission
+    except ExperimentLedgerError:
+        state.save(cfg.state_path)
+        raise
+
+    # ② 시작 대사: (지연체결 반영 후) 실계좌 보유가 보호분+실험분 미만이면 즉시 중단.
     ok, reason = reconcile_or_halt(exp, start_holdings)
     if not ok:
         fills.append({"status": "halted", "reason": f"시작 대사 실패: {reason}"})
         state.last_account_snapshot = start_holdings
         state.save(cfg.state_path)
         return fills, commission_total
-
-    # ② 재시작 복구: 지난 실행에서 미결로 남은 열린주문을 먼저 정산(중복 전송 없이 실체결만 회수).
-    #    experiment_delta = 그 사이 실험이 만든 순 보유 변화 → ③ 사건감지의 '설명 가능분'으로 뺀다.
-    try:
-        rec_commission, experiment_delta = _recover_open_orders(cfg, state, exp, broker, fills)
-        commission_total += rec_commission
-    except ExperimentLedgerError:
-        state.save(cfg.state_path)
-        raise
 
     # ③ 외부 사건 감지(증분5): 지난 실행 종료 스냅샷 대비, 실험이 설명 못하는 보유 변화(수동매매·
     #    기업행동·배당재투자)면 귀속을 추측하지 않고 halt한다(fail-closed). 기준선은 baseline 초기화가
@@ -281,8 +286,17 @@ def _execute_live(cfg, state, exp, orders, guardrail, prices, date, date_iso, co
         state.save(cfg.state_path)
         return fills, commission_total
 
-    # ④ 신규 주문: 전송 '이전'에 의도·멱등키를 영속화(write-ahead) → 전송·정산 → 델타 반영.
+    # ④ 재전송 복구: orderId를 모르는(전송 후 저장 前 사망) 열린주문을 같은 멱등키로 재전송·정산.
+    #    대사·감지를 통과한 뒤에만 — 무단 변경된 계좌에 새 주문을 내지 않기 위해.
+    try:
+        commission_total += _recover_resend_orders(cfg, state, exp, broker, fills)
+    except ExperimentLedgerError:
+        state.save(cfg.state_path)
+        raise
+
+    # ⑤ 신규 주문: 전송 '이전'에 의도·멱등키를 영속화(write-ahead) → 전송·정산 → 델타 반영.
     state_id = _state_id(cfg)
+    seq_by_key: dict[tuple, int] = {}   # (종목,방향)별 순번 — 같은 날 같은 방향 다중주문 키 충돌 방지(#6)
     try:
         for order in orders:
             if not exp.can_trade:   # 복구 중 장부가 중단됐으면 신규 주문 없음(fail-closed)
@@ -295,7 +309,10 @@ def _execute_live(cfg, state, exp, orders, guardrail, prices, date, date_iso, co
                               "status": "blocked", "reason": decision.reason})
                 continue
             order = decision.order
-            coid = ob.stable_client_order_id(state_id, date_iso, order.symbol, order.side)
+            key = (order.symbol, order.side)
+            seq = seq_by_key.get(key, 0)
+            seq_by_key[key] = seq + 1
+            coid = ob.stable_client_order_id(state_id, date_iso, order.symbol, order.side, seq)
             price = prices.get(order.symbol, 0.0)
             reserved_cash = cost.buy_cost(order.quantity, price) if order.side is Side.BUY else 0.0
             reserved_sell = order.quantity if order.side is Side.SELL else 0.0
@@ -313,43 +330,62 @@ def _execute_live(cfg, state, exp, orders, guardrail, prices, date, date_iso, co
         state.save(cfg.state_path)
         raise
 
-    # ⑤ 종료 대사 + 스냅샷 갱신: 체결 후 실계좌를 다시 확인(불일치면 다음 실행부터 fail-closed).
-    #    종료 시점 보유를 다음 실행의 사건감지 비교 기준선으로 영속(증분5).
+    # ⑥ 종료 대사 + 스냅샷 갱신: 체결 후 실계좌를 다시 확인. 불일치면 상태를 남기고 fills에도 노출해
+    #    운영자가 '오늘 주문은 끝났지만 장부는 대사 필요'임을 즉시 알게 한다(#5). 종료 보유는 다음
+    #    실행의 사건감지 비교 기준선으로 영속(증분5).
     end_holdings = broker.account_holdings()
-    reconcile_or_halt(exp, end_holdings)
+    ok_end, reason_end = reconcile_or_halt(exp, end_holdings)
+    if not ok_end:
+        fills.append({"status": "halted", "reason": f"종료 대사 실패: {reason_end}"})
     state.last_account_snapshot = end_holdings
     state.save(cfg.state_path)
     return fills, commission_total
 
 
-def _recover_open_orders(cfg, state, exp, broker, fills) -> tuple[float, dict[str, float]]:
-    """재시작 시 미결 열린주문을 이어받아 실체결 델타만 장부에 반영(중복 전송 없이).
+def _recover_known_orders(cfg, state, exp, broker, fills) -> tuple[float, dict[str, float]]:
+    """전송 완료(orderId 아는) 열린주문을 '조회만'으로 정산해 지연체결을 장부에 먼저 반영(#4).
 
-    orderId를 이미 안다면 재조회(settle_existing)만, 모른다면(전송 후 저장 전 사망) 같은 멱등키로
-    재전송한다 — 브로커의 clientOrderId dedup이 '같은 주문'을 하나로 묶어 중복주문을 막는다.
-    반환: (누적 수수료, 종목별 실험 순 수량 변화) — 뒤 값은 증분5 사건감지가 '설명 가능한 변화'로 뺀다.
+    시작 대사보다 앞서 불러 장부를 최신화한다 — 지연 SELL이 대사를 오탐 halt하지 않게. 전송하지
+    않으므로 계좌를 건드리지 않는다. 반환: (누적 수수료, 종목별 실험 순 수량 변화). 뒤 값은 이미
+    시작 스냅샷에 반영된 체결분이라 증분5 사건감지가 '설명 가능분'으로 뺀다.
     """
     commission_total = 0.0
     experiment_delta: dict[str, float] = {}   # 실험이 만든 순 보유 변화(매수 +, 매도 −)
-    pending = ob.prune_terminal(state.open_orders)   # terminal(완전체결/거부/취소)은 복구 불필요
-    for coid, record in list(pending.items()):
-        order = ob.order_from_record(record)
+    for coid, record in list(ob.prune_terminal(state.open_orders).items()):
         broker_order_id = record.get("broker_order_id")
-        if broker_order_id:
-            result = broker.settle_existing(broker_order_id, order)         # 조회만(전송 없음)
-        else:
-            result = broker.place_and_settle(order, client_order_id=coid)   # 멱등 재전송
-        delta_commission, signed_qty = _apply_and_record(exp, record, result, fills,
-                                                         recovered=True)
+        if not broker_order_id:
+            continue   # orderId 미상 → 재전송 대상(④에서 처리)
+        result = broker.settle_existing(broker_order_id, ob.order_from_record(record))
+        delta_commission, signed_qty = _apply_and_record(exp, record, result, fills, recovered=True)
         commission_total += delta_commission
-        # 사건감지용 delta에는 '조회 복구'(이미 전송된 주문 = 그 체결이 시작 스냅샷에 반영됨)만
-        # 넣는다. '재전송'은 체결이 지금(스냅샷 이후) 일어나므로 시작 스냅샷과 비교할 delta가 아니다.
-        if signed_qty and broker_order_id:
+        if signed_qty:
             experiment_delta[record["symbol"]] = experiment_delta.get(record["symbol"], 0.0) + signed_qty
         if not exp.can_trade:       # 복구 중 불변식 위반이면 남은 주문 복구 중단
             break
     state.open_orders = ob.prune_terminal(state.open_orders)
     return commission_total, experiment_delta
+
+
+def _recover_resend_orders(cfg, state, exp, broker, fills) -> float:
+    """orderId를 모르는(전송 후 저장 前 사망) 열린주문을 같은 멱등키로 재전송·정산.
+
+    대사·사건감지를 통과한 뒤에만 부른다 — 무단 변경된 계좌에 새 주문을 내지 않기 위해. 브로커의
+    clientOrderId dedup이 '같은 주문'을 하나로 묶어 중복주문을 막는다. 반환: 누적 수수료.
+    재전송분의 체결은 시작 스냅샷 '이후'라 사건감지 delta에는 넣지 않는다(그래서 여기선 delta 미반환).
+    """
+    commission_total = 0.0
+    for coid, record in list(ob.prune_terminal(state.open_orders).items()):
+        if record.get("broker_order_id"):
+            continue   # 이미 조회 복구됨(①)
+        if not exp.can_trade:
+            break
+        result = broker.place_and_settle(ob.order_from_record(record), client_order_id=coid)
+        delta_commission, _ = _apply_and_record(exp, record, result, fills, recovered=True)
+        commission_total += delta_commission
+        state.open_orders = ob.prune_terminal(state.open_orders)
+        state.save(cfg.state_path)
+    state.open_orders = ob.prune_terminal(state.open_orders)
+    return commission_total
 
 
 def _apply_and_record(exp, record, result, fills, *, recovered: bool = False) -> tuple[float, float]:
