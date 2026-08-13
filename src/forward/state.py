@@ -21,6 +21,40 @@ SCHEMA_VERSION = 4   # state.json 형식 버전. 구버전(필드 상이)은 로
                      # v4: last_account_snapshot 추가 — 외부 계좌 사건 감지(증분5)의 비교 기준선.
 
 
+def _migrate(data: dict) -> dict:
+    """구버전 state.json을 현재 스키마로 단계적 승격(페이퍼 한정). 승격 불가면 fail-closed.
+
+    정책(스펙 §최초 초기화 — '실계좌 보호 기준선은 자동 추정하지 않는다'):
+    - v2·v3 (실험 장부 모델 이후, 보호분 없음=페이퍼) → 누락 필드만 채워 v4로 승격.
+    - **보호분이 있는 상태(live 기원)** → 자동 변환 금지. 사용자 확인 후 새 --state-dir로 재초기화.
+    - v1 이하(실험 장부 이전 형식)·schema_version 없음·미래 버전 → 변환 없이 fail-closed.
+    """
+    ver = data.get("schema_version")
+    if ver is None:
+        raise ValueError(
+            "구버전 상태 형식입니다(schema_version 없음). 리셋하거나 새 --state-dir로 시작하세요.")
+    if ver == SCHEMA_VERSION:
+        return data
+    if ver > SCHEMA_VERSION:
+        raise ValueError(
+            f"미래 상태 버전 {ver}(현재 {SCHEMA_VERSION}) — 더 최신 코드로 여세요(fail-closed).")
+    if ver < 2:
+        raise ValueError(
+            f"지원하지 않는 상태 버전 {ver} — 실험 장부 모델 이전 형식이라 변환 불가. 새 --state-dir을 쓰세요.")
+    protected = (data.get("experiment") or {}).get("protected_positions") or {}
+    if protected:
+        raise ValueError(
+            f"보호 기준선이 있는 상태(live 기원, 버전 {ver})는 자동 마이그레이션하지 않습니다. "
+            "사용자 확인 후 새 --state-dir로 재초기화하세요(보호분 자동 추정 금지).")
+    data = dict(data)
+    if ver < 3:                       # v2→v3: 열린주문 장부
+        data.setdefault("open_orders", {})
+    if ver < 4:                       # v3→v4: 사건감지 비교 기준선
+        data.setdefault("last_account_snapshot", {})
+    data["schema_version"] = SCHEMA_VERSION
+    return data
+
+
 def _config_diff(a: dict, b: dict) -> str:
     """두 canonical 설정의 차이를 사람이 읽을 문자열로. 같으면 빈 문자열."""
     keys = sorted(set(a) | set(b))
@@ -72,15 +106,9 @@ class ForwardState:
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            ver = data.get("schema_version")
-            if ver is None:
-                raise ValueError(
-                    "구버전 상태 형식입니다(schema_version 없음). 리셋하거나 새 --state-dir로 시작하세요.")
-            if ver != SCHEMA_VERSION:
-                # 마이그레이션 함수가 생기기 전까지는 '정확히 일치'만 허용(변환 없는 통과 금지).
-                raise ValueError(
-                    f"지원하지 않는 상태 버전 {ver}(현재 {SCHEMA_VERSION}). 명시적 마이그레이션 없이는 "
-                    f"열지 않습니다 — 새 --state-dir을 쓰세요.")
+            # 버전이 다르면 명시적 마이그레이션을 시도한다(페이퍼는 승격, 그 외는 fail-closed).
+            if data.get("schema_version") != SCHEMA_VERSION:
+                data = _migrate(data)
             exp = ExperimentPortfolio.from_dict(data["experiment"])
             st = cls(
                 budget=data["budget"], symbols=list(data["symbols"]),
@@ -94,7 +122,9 @@ class ForwardState:
                 pending_signals=list(data.get("pending_signals") or []),
                 open_orders=dict(data.get("open_orders") or {}),
                 last_account_snapshot=dict(data.get("last_account_snapshot") or {}),
-                schema_version=ver, config=dict(data.get("config") or {}))
+                schema_version=SCHEMA_VERSION, config=dict(data.get("config") or {}))
+            # 구버전 config엔 mode 키가 없다(모두 paper였다) — 대조 전에 paper로 백필해 오탐 방지.
+            st.config.setdefault("mode", "paper")
             if abs(st.budget - budget) > 1e-9 or sorted(st.symbols) != sorted(symbols):
                 raise ValueError(
                     f"기존 실험과 구성이 다릅니다(budget/symbols). "

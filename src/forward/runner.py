@@ -52,6 +52,7 @@ class ForwardConfig:
         """결과에 영향 주는 설정 — state에 고정해 재실행 시 대조(다른 실험 혼입 방지)."""
         return {
             "source": self.source, "strategy": self.strategy, "model": self.model,
+            "mode": self.mode,   # paper↔live 혼입 차단 — 체결 성격이 다른 곡선이 섞이지 않게(#5)
             "lookback": self.lookback, "min_trade": self.min_trade,
             "slippage": self.slippage, "commission_rate": self.commission_rate,
             "fixed_fee": self.fixed_fee, "days": self.days, "seed": self.seed,

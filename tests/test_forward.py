@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -14,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.core.types import Action, MarketSnapshot, Signal
 from src.data.synthetic import make_synthetic_store
 from src.forward.runner import ForwardConfig, build_report, run_once
-from src.forward.state import ForwardState
+from src.forward.state import ForwardState, SCHEMA_VERSION
 from src.strategy.base import Strategy
 from src.strategy.llm_agent.memory import DecisionMemory
 
@@ -231,6 +232,67 @@ def test_old_schema_fails_closed():
             raised = False
         except ValueError as e:
             raised = "구버전" in str(e)
+        assert raised
+
+
+def _write_v3_paper_state(path, protected=None):
+    """v3(last_account_snapshot 이전) 페이퍼 상태 파일을 만든다(마이그레이션 테스트용)."""
+    data = {
+        "schema_version": 3, "budget": 100.0, "symbols": ["AAA"],
+        "source": "synthetic", "strategy": "momentum", "model": "-",
+        "experiment": {"initial_capital": 100.0, "cash": 100.0,
+                       "protected_positions": protected or {}, "experiment_positions": {}},
+        "open_orders": {},   # v3엔 있음. last_account_snapshot은 없음(v4에서 추가).
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def test_migrate_v3_paper_state_to_current():
+    """v3 페이퍼 상태는 누락 필드를 채워 현재 스키마로 승격되어 로드된다(#1)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "state.json")
+        _write_v3_paper_state(path)
+        st = ForwardState.load_or_init(path, budget=100.0, symbols=["AAA"],
+                                       source="synthetic", strategy="momentum", model="-")
+        assert st.schema_version == SCHEMA_VERSION
+        assert st.last_account_snapshot == {}          # v4 필드가 기본값으로 채워짐
+        st.save(path)                                   # 저장 시 v4로 영속
+        assert json.load(open(path, encoding="utf-8"))["schema_version"] == SCHEMA_VERSION
+
+
+def test_migrate_refuses_live_origin_baseline():
+    """보호 기준선이 있는 상태(live 기원)는 자동 마이그레이션하지 않는다(#1, 보호분 자동추정 금지)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "state.json")
+        _write_v3_paper_state(path, protected={"AAA": 10.0})
+        try:
+            ForwardState.load_or_init(path, budget=100.0, symbols=["AAA"],
+                                      source="synthetic", strategy="momentum", model="-")
+            raised = False
+        except ValueError as e:
+            raised = "자동 마이그레이션" in str(e)
+        assert raised
+
+
+def test_paper_and_live_mode_not_mixed_in_one_state_dir():
+    """paper로 만든 상태를 live 설정으로 다시 열면 config 대조에서 fail-closed(#5)."""
+    with tempfile.TemporaryDirectory() as d:
+        paper = ForwardConfig(symbols=["AAA"], mode="paper", source="synthetic",
+                              strategy="momentum", model="-", state_dir=d)
+        st = ForwardState.load_or_init(paper.state_path, budget=100.0, symbols=["AAA"],
+                                       source="synthetic", strategy="momentum", model="-",
+                                       config=paper.canonical())
+        st.save(paper.state_path)
+        live = ForwardConfig(symbols=["AAA"], mode="live", source="synthetic",
+                             strategy="momentum", model="-", state_dir=d)
+        try:
+            ForwardState.load_or_init(live.state_path, budget=100.0, symbols=["AAA"],
+                                      source="synthetic", strategy="momentum", model="-",
+                                      config=live.canonical())
+            raised = False
+        except ValueError as e:
+            raised = "mode" in str(e)
         assert raised
 
 
