@@ -120,7 +120,9 @@ def init_baseline(cfg: ForwardConfig, *, confirm: bool,
     exp = build_baseline(cfg.budget, holdings)
     state = ForwardState(
         budget=cfg.budget, symbols=cfg.symbols, source=cfg.source,
-        strategy=cfg.strategy, model=cfg.model, experiment=exp, config=cfg.canonical())
+        strategy=cfg.strategy, model=cfg.model, experiment=exp, config=cfg.canonical(),
+        # 사건감지(증분5) 비교 기준선 — 첫 실행이 이 스냅샷 대비 외부 변화를 잡는다.
+        last_account_snapshot={s: q for s, q in holdings.items() if q > 0})
     state.save(cfg.state_path)
     print(f"✅ 보호 기준선 저장 완료: {cfg.state_path}\n"
           f"   보호 {len(exp.protected_positions)}종목 · 실험 현금 ${cfg.budget:.2f} · 실험분 0.\n"

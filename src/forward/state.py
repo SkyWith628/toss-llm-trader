@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from src.core.types import Portfolio
 from src.forward.experiment_portfolio import ExperimentPortfolio
 
-SCHEMA_VERSION = 3   # state.json 형식 버전. 구버전(필드 상이)은 로드 시 fail-closed.
+SCHEMA_VERSION = 4   # state.json 형식 버전. 구버전(필드 상이)은 로드 시 fail-closed.
                      # v3: open_orders(열린주문 장부) 추가 — live 멱등키/부분체결 재시작 복구용.
+                     # v4: last_account_snapshot 추가 — 외부 계좌 사건 감지(증분5)의 비교 기준선.
 
 
 def _config_diff(a: dict, b: dict) -> str:
@@ -49,6 +50,9 @@ class ForwardState:
     # live 열린주문 장부 — intent_id -> 열린주문 레코드(order_book.py). 전송 '이전'에 여기에
     # 기록·영속하고(write-ahead), 재시작 시 미결 주문을 이어받아 중복주문을 막는다. 페이퍼는 {}.
     open_orders: dict[str, dict] = field(default_factory=dict)
+    # 외부 계좌 사건 감지(증분5)의 비교 기준선 — 지난 실행 종료 시 관측한 실계좌 보유. 이번 실행
+    # 시작 보유와 비교해 '실험이 설명 못하는 변화'(수동매매·기업행동)를 잡아 halt. 페이퍼는 {}.
+    last_account_snapshot: dict[str, float] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
     config: dict = field(default_factory=dict)   # 결과에 영향 주는 설정(재실행 시 대조)
 
@@ -89,6 +93,7 @@ class ForwardState:
                 memory=list(data.get("memory") or []),
                 pending_signals=list(data.get("pending_signals") or []),
                 open_orders=dict(data.get("open_orders") or {}),
+                last_account_snapshot=dict(data.get("last_account_snapshot") or {}),
                 schema_version=ver, config=dict(data.get("config") or {}))
             if abs(st.budget - budget) > 1e-9 or sorted(st.symbols) != sorted(symbols):
                 raise ValueError(
@@ -118,6 +123,7 @@ class ForwardState:
             "bh_shares": self.bh_shares, "bh_anchor": self.bh_anchor,
             "memory": self.memory, "pending_signals": self.pending_signals,
             "open_orders": self.open_orders,
+            "last_account_snapshot": self.last_account_snapshot,
         }
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:

@@ -24,6 +24,7 @@ from src.risk.guardrail import Guardrail
 from src.strategy.base import Strategy
 from src.forward import order_book as ob
 from src.forward.carveout_broker import CarveOutBroker
+from src.forward.events import detect_events, summarize
 from src.forward.experiment_portfolio import ExperimentLedgerError
 from src.forward.reconcile import reconcile_or_halt
 from src.forward.state import ForwardState
@@ -241,29 +242,46 @@ def _execute_paper(cfg, state, exp, orders, guardrail, prices, date, cost):
 
 
 def _execute_live(cfg, state, exp, orders, guardrail, prices, date, date_iso, cost, broker):
-    """실계좌 집행 — 전후 대사 + 열린주문 write-ahead 영속 + 부분체결 델타 정산.
+    """실계좌 집행 — 전후 대사 + 열린주문 복구 + 외부 사건 감지 + 부분체결 델타 정산.
 
-    순서: ①시작 대사 → ②미결 열린주문 복구(재시작) → ③신규 주문(전송 前 영속·정산) → ④종료 대사.
-    어느 단계든 대사 실패/장부 중단이면 신규 주문을 멈춘다(fail-closed). 반환: (fills, 누적 수수료).
+    순서: ①시작 대사 → ②미결 열린주문 복구(재시작) → ③외부 사건 감지(증분5) → ④신규 주문(전송 前
+    영속·정산) → ⑤종료 대사·스냅샷 갱신. 어느 단계든 대사 실패/사건/장부 중단이면 신규 주문을
+    멈춘다(fail-closed). 반환: (fills, 누적 수수료).
     """
     fills: list[dict] = []
     commission_total = 0.0
+    start_holdings = broker.account_holdings()   # 이번 실행 시작 시점 실계좌 보유(대사·사건감지 공용)
 
     # ① 시작 대사: 실계좌 보유가 보호분+실험분 미만이면(수동매매/출금 의심) 즉시 중단.
-    ok, reason = reconcile_or_halt(exp, broker.account_holdings())
+    ok, reason = reconcile_or_halt(exp, start_holdings)
     if not ok:
         fills.append({"status": "halted", "reason": f"시작 대사 실패: {reason}"})
+        state.last_account_snapshot = start_holdings
         state.save(cfg.state_path)
         return fills, commission_total
 
     # ② 재시작 복구: 지난 실행에서 미결로 남은 열린주문을 먼저 정산(중복 전송 없이 실체결만 회수).
+    #    experiment_delta = 그 사이 실험이 만든 순 보유 변화 → ③ 사건감지의 '설명 가능분'으로 뺀다.
     try:
-        commission_total += _recover_open_orders(cfg, state, exp, broker, fills)
+        rec_commission, experiment_delta = _recover_open_orders(cfg, state, exp, broker, fills)
+        commission_total += rec_commission
     except ExperimentLedgerError:
         state.save(cfg.state_path)
         raise
 
-    # ③ 신규 주문: 전송 '이전'에 의도·멱등키를 영속화(write-ahead) → 전송·정산 → 델타 반영.
+    # ③ 외부 사건 감지(증분5): 지난 실행 종료 스냅샷 대비, 실험이 설명 못하는 보유 변화(수동매매·
+    #    기업행동·배당재투자)면 귀속을 추측하지 않고 halt한다(fail-closed). 기준선은 baseline 초기화가
+    #    항상 채우므로(빈 전용계좌면 {}) live에선 매 실행 비교한다 — 빈 dict라고 건너뛰지 않는다
+    #    (그러면 빈 계좌에 낀 수동매수를 놓친다). 설명 가능분(experiment_delta)은 잔여에서 뺀다.
+    detected = detect_events(state.last_account_snapshot, start_holdings, experiment_delta)
+    if detected:
+        exp.halt("외부 계좌 사건 감지: " + summarize(detected))
+        fills.append({"status": "halted", "reason": exp.status_reason, "events": detected})
+        state.last_account_snapshot = start_holdings
+        state.save(cfg.state_path)
+        return fills, commission_total
+
+    # ④ 신규 주문: 전송 '이전'에 의도·멱등키를 영속화(write-ahead) → 전송·정산 → 델타 반영.
     state_id = _state_id(cfg)
     try:
         for order in orders:
@@ -287,26 +305,32 @@ def _execute_live(cfg, state, exp, orders, guardrail, prices, date, date_iso, co
             state.save(cfg.state_path)   # ← 전송 前 저장: 여기서 죽어도 재시작이 같은 키로 이어받음
 
             result = broker.place_and_settle(order, client_order_id=coid, when=date)
-            commission_total += _apply_and_record(exp, record, result, fills)
+            delta_commission, _ = _apply_and_record(exp, record, result, fills)
+            commission_total += delta_commission
             state.open_orders = ob.prune_terminal(state.open_orders)
             state.save(cfg.state_path)
     except ExperimentLedgerError:
         state.save(cfg.state_path)
         raise
 
-    # ④ 종료 대사: 체결 후 실계좌를 다시 확인(불일치면 다음 실행부터 fail-closed).
-    reconcile_or_halt(exp, broker.account_holdings())
+    # ⑤ 종료 대사 + 스냅샷 갱신: 체결 후 실계좌를 다시 확인(불일치면 다음 실행부터 fail-closed).
+    #    종료 시점 보유를 다음 실행의 사건감지 비교 기준선으로 영속(증분5).
+    end_holdings = broker.account_holdings()
+    reconcile_or_halt(exp, end_holdings)
+    state.last_account_snapshot = end_holdings
     state.save(cfg.state_path)
     return fills, commission_total
 
 
-def _recover_open_orders(cfg, state, exp, broker, fills) -> float:
+def _recover_open_orders(cfg, state, exp, broker, fills) -> tuple[float, dict[str, float]]:
     """재시작 시 미결 열린주문을 이어받아 실체결 델타만 장부에 반영(중복 전송 없이).
 
     orderId를 이미 안다면 재조회(settle_existing)만, 모른다면(전송 후 저장 전 사망) 같은 멱등키로
     재전송한다 — 브로커의 clientOrderId dedup이 '같은 주문'을 하나로 묶어 중복주문을 막는다.
+    반환: (누적 수수료, 종목별 실험 순 수량 변화) — 뒤 값은 증분5 사건감지가 '설명 가능한 변화'로 뺀다.
     """
     commission_total = 0.0
+    experiment_delta: dict[str, float] = {}   # 실험이 만든 순 보유 변화(매수 +, 매도 −)
     pending = ob.prune_terminal(state.open_orders)   # terminal(완전체결/거부/취소)은 복구 불필요
     for coid, record in list(pending.items()):
         order = ob.order_from_record(record)
@@ -315,22 +339,31 @@ def _recover_open_orders(cfg, state, exp, broker, fills) -> float:
             result = broker.settle_existing(broker_order_id, order)         # 조회만(전송 없음)
         else:
             result = broker.place_and_settle(order, client_order_id=coid)   # 멱등 재전송
-        commission_total += _apply_and_record(exp, record, result, fills, recovered=True)
+        delta_commission, signed_qty = _apply_and_record(exp, record, result, fills,
+                                                         recovered=True)
+        commission_total += delta_commission
+        # 사건감지용 delta에는 '조회 복구'(이미 전송된 주문 = 그 체결이 시작 스냅샷에 반영됨)만
+        # 넣는다. '재전송'은 체결이 지금(스냅샷 이후) 일어나므로 시작 스냅샷과 비교할 delta가 아니다.
+        if signed_qty and broker_order_id:
+            experiment_delta[record["symbol"]] = experiment_delta.get(record["symbol"], 0.0) + signed_qty
         if not exp.can_trade:       # 복구 중 불변식 위반이면 남은 주문 복구 중단
             break
     state.open_orders = ob.prune_terminal(state.open_orders)
-    return commission_total
+    return commission_total, experiment_delta
 
 
-def _apply_and_record(exp, record, result, fills, *, recovered: bool = False) -> float:
-    """브로커 응답을 델타 정산해 장부에 반영하고 fills 행을 남긴다. 반환: 델타 수수료.
+def _apply_and_record(exp, record, result, fills, *, recovered: bool = False) -> tuple[float, float]:
+    """브로커 응답을 델타 정산해 장부에 반영하고 fills 행을 남긴다.
 
     브로커의 filled_qty는 '누적'이라, 이미 반영한 만큼을 뺀 델타만 장부에 흘린다(이중 카운트 방지).
+    반환: (델타 수수료, 실험 순 수량 변화 — 매수 +, 매도 −). 뒤 값은 사건감지가 '설명 가능분'으로 쓴다.
     """
     delta_qty, delta_commission, fill_price = ob.settle_delta(record, result)
+    signed_qty = 0.0
     if delta_qty > 0:
-        _apply_fill(exp, Side(record["side"]), record["symbol"],
-                    delta_qty, fill_price, delta_commission)
+        side = Side(record["side"])
+        _apply_fill(exp, side, record["symbol"], delta_qty, fill_price, delta_commission)
+        signed_qty = delta_qty if side is Side.BUY else -delta_qty
     fills.append({
         "symbol": record["symbol"], "side": record["side"],
         "qty": round(record["requested_qty"], 6),
@@ -340,7 +373,7 @@ def _apply_and_record(exp, record, result, fills, *, recovered: bool = False) ->
         "broker_order_id": record.get("broker_order_id", ""),
         "recovered": recovered, "reason": record.get("reason", ""),
     })
-    return delta_commission
+    return delta_commission, signed_qty
 
 
 def _build_live_broker(cfg: ForwardConfig, exp, cost: CostModel) -> CarveOutBroker:
