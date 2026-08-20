@@ -22,6 +22,32 @@ class StaleFeedError(RuntimeError):
     """양호한(신선·유효) 시세를 얻지 못함 — 이 틱의 판단을 건너뛰라는 신호."""
 
 
+class FeedExhausted(RuntimeError):
+    """리플레이 시세가 소진됨 — 폐장과 동치(오케스트레이터가 그날 루프를 끝낸다)."""
+
+
+class ReplayFeed:
+    """미리 로드한 틱 시퀀스를 순차 반환(백테스트·드라이런). 소진 시 FeedExhausted.
+
+    실시간 방어(RealtimeFeed)와 달리 데이터가 이미 정제됐다고 보고 검증은 생략한다.
+    quotes() 인터페이스가 같아 오케스트레이터에 그대로 주입된다.
+    """
+    def __init__(self, ticks: list[dict[str, float]]) -> None:
+        self._ticks = [dict(t) for t in ticks]
+        self._i = 0
+
+    @property
+    def remaining(self) -> int:
+        return len(self._ticks) - self._i
+
+    def quotes(self) -> dict[str, float]:
+        if self._i >= len(self._ticks):
+            raise FeedExhausted("리플레이 틱 소진")
+        tick = self._ticks[self._i]
+        self._i += 1
+        return dict(tick)
+
+
 class RealtimeFeed:
     def __init__(
         self,

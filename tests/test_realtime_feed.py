@@ -13,7 +13,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.market.feed import RealtimeFeed, StaleFeedError
+from src.market.feed import (FeedExhausted, RealtimeFeed, ReplayFeed,
+                             StaleFeedError)
 
 _SYMBOLS = ["AAPL", "MSFT"]
 
@@ -112,6 +113,18 @@ def test_invalid_max_jump_rejected():
             RealtimeFeed(_FakeSource([{}]), _SYMBOLS, max_jump=bad); assert False
         except ValueError:
             pass
+
+
+def test_replay_feed_yields_then_exhausts():
+    f = ReplayFeed([{"AAPL": 100.0}, {"AAPL": 101.0}])
+    assert f.remaining == 2
+    assert f.quotes() == {"AAPL": 100.0}
+    assert f.quotes() == {"AAPL": 101.0}
+    assert f.remaining == 0
+    try:
+        f.quotes(); assert False, "소진 후엔 FeedExhausted여야 함"
+    except FeedExhausted:
+        pass
 
 
 if __name__ == "__main__":

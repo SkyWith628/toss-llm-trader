@@ -99,6 +99,13 @@ def test_naive_datetime_treated_as_utc():
     assert c.is_open(datetime(2026, 7, 6, 14, 0)) is True
 
 
+def test_local_date_is_et():
+    """UTC를 ET 날짜로. 07-06 02:00 UTC = 07-05 22:00 EDT → 전날."""
+    c = MarketClock()
+    assert c.local_date(_utc(2026, 7, 6, 14, 0)) == "2026-07-06"
+    assert c.local_date(_utc(2026, 7, 6, 2, 0)) == "2026-07-05"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

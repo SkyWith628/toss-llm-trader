@@ -81,6 +81,10 @@ class MarketClock:
         return open_dt, close_dt
 
     # --- 공개 API ---
+    def local_date(self, now_utc: datetime) -> str:
+        """해당 UTC 시각의 ET 날짜(ISO). 상태의 trading_date 기준 — 하루 경계 판정용."""
+        return self._to_local(now_utc).date().isoformat()
+
     def is_open(self, now_utc: datetime) -> bool:
         local = self._to_local(now_utc)
         session = self._session(local)
