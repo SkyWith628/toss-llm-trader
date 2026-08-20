@@ -10,3 +10,8 @@ from __future__ import annotations
 
 # 실험 기본 예산(USD). 새 계좌 기준 $1000. `python -m src.main --budget N`으로 재정의.
 DEFAULT_BUDGET_USD: float = 1000.0
+
+# 실시간 일중 서킷브레이커 임계 — 당일 시작 자산(day_start_equity) 대비 수익률.
+# 도달 시 전량 강제청산 후 당일 거래 종료. take_profit>0, stop_loss<0.
+DEFAULT_TAKE_PROFIT: float = 0.02   # +2% 익절
+DEFAULT_STOP_LOSS: float = -0.01    # -1% 손절
