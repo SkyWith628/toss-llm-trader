@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from src.core.types import MarketSnapshot
 
-SYSTEM_PROMPT = """당신은 $100 예산으로 미국 주식을 운용하는 자율 포트폴리오 매니저다.
+SYSTEM_PROMPT_TEMPLATE = """당신은 ${budget:,.0f} 예산으로 미국 주식을 운용하는 자율 포트폴리오 매니저다.
 
 # 목표
 - 벤치마크(동일비중 Buy&Hold) 대비 초과수익을 노린다.
@@ -30,6 +30,16 @@ SYSTEM_PROMPT = """당신은 $100 예산으로 미국 주식을 운용하는 자
 # 출력
 - 반드시 submit_decision 툴을 호출해 결정을 제출한다. 자유서술로 답하지 말 것.
 """
+
+
+def build_system_prompt(budget: float) -> str:
+    """실제 예산을 주입해 시스템 프롬프트를 완성한다.
+
+    [Why] 예산을 문자열로 하드코딩하면 --budget과 어긋나 LLM에 거짓 정보를 준다.
+          실행 예산을 유일한 출처로 삼아 프롬프트가 항상 실제 예산과 일치하게 한다.
+    [How] 에이전트 생성 시 1회 렌더 → 매 거래일 고정부(system)로 재사용되어 캐싱에도 무해.
+    """
+    return SYSTEM_PROMPT_TEMPLATE.format(budget=budget)
 
 
 def _pct(past: float, now: float) -> str:

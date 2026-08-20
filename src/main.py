@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 
+from src.config import DEFAULT_BUDGET_USD
 from src.core.clock import BacktestClock
 from src.data.synthetic import make_synthetic_store, make_yfinance_store
 from src.execution.paper_broker import PaperBroker
@@ -54,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LLM 자율매매 실험 — 단계 0 파이프라인")
     p.add_argument("--symbols", default="AAA,BBB,CCC,DDD",
                    help="쉼표구분. yfinance면 실티커(예: AAPL,MSFT,NVDA)")
-    p.add_argument("--budget", type=float, default=100.0)
+    p.add_argument("--budget", type=float, default=DEFAULT_BUDGET_USD)
     p.add_argument("--days", type=int, default=180)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--source", choices=["synthetic", "yfinance"], default="synthetic")
@@ -71,7 +72,7 @@ def build_strategy(args: argparse.Namespace):
     """전략 조립 — 여기만 갈아끼우면 동일 백테스트 환경에서 공정 비교가 된다."""
     if args.strategy == "llm":
         from src.strategy.llm_agent import LLMAgentStrategy  # 선택 의존성(anthropic)
-        return LLMAgentStrategy(model=args.model,
+        return LLMAgentStrategy(model=args.model, budget=args.budget,
                                 log_path=os.path.abspath(LLM_LOG_PATH))
     return MomentumStrategy(lookback=args.lookback, top_k=args.top_k)
 

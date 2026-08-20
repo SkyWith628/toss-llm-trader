@@ -3,7 +3,7 @@
 [What] OAuth2(client_credentials)로 토큰을 받아 REST로 시세·잔고·주문을 처리하는
        BrokerClient 구현. 기본은 dry-run(실주문 차단), live=True일 때만 POST /orders.
 [Why]  단계 0~1에서 PaperBroker로 검증한 파이프라인을 '코드 수정 없이' 실계좌로 옮기기
-       위해 BrokerClient 계약만 만족한다. $100 실험이라도 실계좌는 되돌릴 수 없으므로
+       위해 BrokerClient 계약만 만족한다. 소액 실험이라도 실계좌는 되돌릴 수 없으므로
        안전을 '기본값'으로: read(시세/잔고)는 허용, write(주문)는 명시적 opt-in.
 [How]  퀀트 실무에서 집행(execution)을 브로커 뒤로 숨겨 알파/리스크와 분리하는 방식.
 
@@ -29,6 +29,7 @@ import uuid
 from datetime import datetime
 from typing import Callable
 
+from src.config import DEFAULT_BUDGET_USD
 from src.core.types import Order, OrderResult, Portfolio, Position, Side
 from src.execution.broker_base import BrokerClient
 
@@ -100,7 +101,7 @@ class TossBroker(BrokerClient):
         account_no: str,
         symbols: list[str],
         *,
-        budget: float = 100.0,
+        budget: float = DEFAULT_BUDGET_USD,
         live: bool = False,
         currency: str = "USD",
         base_url: str = DEFAULT_BASE_URL,
@@ -261,7 +262,7 @@ class TossBroker(BrokerClient):
 
 
 def build_toss_broker_from_env(
-    symbols: list[str], *, budget: float = 100.0, currency: str = "USD",
+    symbols: list[str], *, budget: float = DEFAULT_BUDGET_USD, currency: str = "USD",
     transport: Transport | None = None,
 ) -> TossBroker:
     """.env(환경변수)에서 자격증명을 읽어 TossBroker를 조립.

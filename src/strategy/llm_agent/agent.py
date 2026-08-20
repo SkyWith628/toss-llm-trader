@@ -12,6 +12,7 @@ import json
 import os
 from typing import Any
 
+from src.config import DEFAULT_BUDGET_USD
 from src.core.types import MarketSnapshot, Signal
 from src.strategy.base import Strategy
 from src.strategy.llm_agent.decision_tool import (
@@ -20,7 +21,7 @@ from src.strategy.llm_agent.decision_tool import (
     decision_to_signals,
 )
 from src.strategy.llm_agent.memory import DecisionMemory
-from src.strategy.llm_agent.prompts import SYSTEM_PROMPT, render_snapshot
+from src.strategy.llm_agent.prompts import build_system_prompt, render_snapshot
 
 
 class LLMAgentStrategy(Strategy):
@@ -33,6 +34,7 @@ class LLMAgentStrategy(Strategy):
         client: Any | None = None,
         log_path: str | None = None,
         max_memory: int = 5,
+        budget: float = DEFAULT_BUDGET_USD,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
@@ -40,6 +42,8 @@ class LLMAgentStrategy(Strategy):
         self.name = f"llm_agent({model})"
         self._client = client  # 테스트에서 목(mock) 주입 가능
         self.memory = DecisionMemory(max_memory)  # 직전 결정·회고(연속적 의사결정)
+        # 실제 예산을 주입해 프롬프트를 1회 완성 → LLM이 항상 실제 예산으로 판단한다.
+        self.system_prompt = build_system_prompt(budget)
 
     @property
     def client(self) -> Any:
@@ -68,7 +72,7 @@ class LLMAgentStrategy(Strategy):
                 # 통째로 캐시된다. 매일 바뀌는 user 메시지는 캐시 밖(의도된 분리).
                 system=[{
                     "type": "text",
-                    "text": SYSTEM_PROMPT,
+                    "text": self.system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }],
                 messages=[{"role": "user", "content": user_msg}],
