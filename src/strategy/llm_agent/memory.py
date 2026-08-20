@@ -41,6 +41,25 @@ class DecisionMemory:
     def __len__(self) -> int:
         return len(self._entries)
 
+    def to_list(self) -> list[dict]:
+        """현재 기억을 직렬화(포워드 테스트에서 프로세스 간 지속하기 위함)."""
+        return [
+            {"date": e.date, "market_view": e.market_view,
+             "weights": e.weights, "prices": e.prices}
+            for e in self._entries
+        ]
+
+    @classmethod
+    def from_list(cls, items: list[dict], max_entries: int = 5) -> "DecisionMemory":
+        """직렬화된 기억을 복원. 시간순으로 record해 링버퍼 규칙(maxlen)을 그대로 태운다."""
+        mem = cls(max_entries)
+        for it in items:
+            mem.record(
+                it.get("date", ""), it.get("market_view", ""),
+                dict(it.get("weights", {})), dict(it.get("prices", {})),
+            )
+        return mem
+
     def retrospective(self, current_prices: dict[str, float]) -> str:
         """가장 최근 결정 대비 지금까지의 결과를 회고 텍스트로. 없으면 빈 문자열."""
         if not self._entries:
