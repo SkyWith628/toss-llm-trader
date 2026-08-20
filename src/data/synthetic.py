@@ -85,7 +85,8 @@ def make_yfinance_store(
         date = ts.to_pydatetime()
         prices = {}
         for s in symbols:
-            val = row[s] if len(symbols) > 1 else row
+            # 종목수와 무관하게 종목 컬럼으로 안전 추출(단일=Series 특수처리 버그 제거).
+            val = row[s] if s in row.index else float("nan")
             if val == val:  # NaN 체크
                 prices[s] = float(round(val, 4))
         if len(prices) == len(symbols):

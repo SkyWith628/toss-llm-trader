@@ -56,7 +56,9 @@ def load_intraday_ticks(symbols: list[str], period: str, interval: str):
     for ts, row in closes.iterrows():
         prices = {}
         for s in symbols:
-            val = row[s] if len(symbols) > 1 else row
+            # yfinance는 종목수와 무관하게 Close를 종목 컬럼 DataFrame으로 준다(리스트 입력).
+            # 단일 종목도 row[s]로 안전하게 뽑는다(예전 '단일=Series' 특수처리 버그 제거).
+            val = row[s] if s in row.index else float("nan")
             if val == val:  # NaN 아님
                 prices[s] = float(round(val, 4))
         if len(prices) == len(symbols):
