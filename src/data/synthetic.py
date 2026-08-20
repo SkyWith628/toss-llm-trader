@@ -76,8 +76,10 @@ def make_yfinance_store(
         ) from exc
 
     store = PriceStore(symbols)
+    # threads=False: 스레드 다운로더가 tz 캐시(SQLite)를 동시에 써서 'database is locked'가
+    # 나는 것을 방지. 소수 종목이라 순차 다운로드 비용은 무시할 수준.
     data = yf.download(symbols, period=period, interval=interval,
-                       auto_adjust=True, progress=False)
+                       auto_adjust=True, progress=False, threads=False)
     closes = data["Close"]
     for ts, row in closes.iterrows():
         date = ts.to_pydatetime()
