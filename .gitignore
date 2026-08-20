@@ -3,7 +3,7 @@
 *skywith*
 __pycache__/
 *.pyc
-logs/*.jsonl
+logs/
 .venv/
 venv/
 .DS_Store
