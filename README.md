@@ -42,5 +42,7 @@ python3 tests/test_smoke.py && python3 tests/test_llm_agent.py   # 테스트
 ## 로드맵
 1. ✅ **LLM 에이전트 전략** (`strategy/llm_agent/`) — tool-calling 결정 · 메모리·회고 · 캐싱
 2. ✅ **TossBroker** (`execution/toss_broker.py`) — 토스 Open API REST 연동(OAuth2·시세·잔고·주문). 실스펙 정합·단위테스트 완료, **실키 연동 검증 대기**. 기본 dry-run(실주문은 `TRADING_MODE=live`).
-3. **Forward 페이퍼 테스트** — 실시간 모의 2~4주, Buy&Hold 대비 측정
-4. (선택) 실계좌 $1000 — 검증 통과 후
+3. **실시간 일중 시스템** (`market/`·`risk/day_risk.py`·`runtime/`) — 장중 상시 감시로 당일
+   시작자산 대비 +2%/-1% 도달 시 전량 강제청산. 개장 1회 LLM 결정 + 결정론적 서킷브레이커.
+   Toss 실시간 REST 폴링. (진행 중: `market/clock.py` MarketClock 완료)
+4. (선택) 실계좌 $1000 — 페이퍼·dry-run 검증 통과 후
