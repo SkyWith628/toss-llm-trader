@@ -105,7 +105,8 @@ def load_intraday_ticks(symbols: list[str], period: str, interval: str):
 
 
 def run_dryrun(symbols, budget, take_profit, stop_loss, period, interval,
-               decider="equal", lookback=60, entry_interval=5, max_entry_calls=6) -> dict:
+               decider="equal", lookback=60, entry_interval=5, max_entry_calls=6,
+               trailing=None, trailing_arm=0.0) -> dict:
     date, ticks = load_intraday_ticks(symbols, period, interval)
     if not ticks:
         return {"status": "error", "reason": "1분봉 데이터 없음(장중/직전 세션 확인)"}
@@ -129,7 +130,8 @@ def run_dryrun(symbols, budget, take_profit, stop_loss, period, interval,
         feed=ReplayFeed(ticks),
         broker=PaperBroker(starting_cash=budget),
         guardrail=Guardrail(budget=budget, valid_symbols=set(symbols)),
-        risk=DayRiskManager(take_profit=take_profit, stop_loss=stop_loss),
+        risk=DayRiskManager(take_profit=take_profit, stop_loss=stop_loss,
+                            trailing=trailing, trailing_arm=trailing_arm),
         state=IntradayState.new(budget, symbols),
         open_decider=open_decider,
         entry_decider=entry_decider,
@@ -165,7 +167,9 @@ def _print(r: dict, symbols: list[str]) -> None:
     print(f"  당일 시작자산  : ${r['day_start_equity']:,.2f}")
     print(f"  장중 최고/최저 : {r['peak_return']:+.2%} / {r['trough_return']:+.2%}")
     if r["halted"]:
-        label = "익절(TAKE_PROFIT)" if r["halt_reason"] == "take_profit" else "손절(STOP_LOSS)"
+        halt_labels = {"take_profit": "익절(TAKE_PROFIT)", "stop_loss": "손절(STOP_LOSS)",
+                       "trailing_stop": "트레일링(TRAILING_STOP)"}
+        label = halt_labels.get(r["halt_reason"], r["halt_reason"])
         print(f"  서킷브레이커   : ⚡ 발동 → {label} → 전량 청산")
     else:
         print(f"  서킷브레이커   : 미발동(밴드 내 유지) → 폐장까지 보유")
@@ -190,12 +194,17 @@ def main() -> None:
                    help="timing: 몇 틱(1분봉)마다 진입을 판단할지")
     p.add_argument("--max-entry-calls", type=int, default=6,
                    help="timing: 하루 최대 진입 판단(LLM 호출) 횟수 상한")
+    p.add_argument("--trailing", type=float, default=None,
+                   help="트레일링 스톱 δ(예: 0.005=고점대비 -0.5%% 되돌림 청산). 미지정=끔")
+    p.add_argument("--trailing-arm", type=float, default=0.0,
+                   help="트레일링 무장 임계 a(예: 0.008=고점 +0.8%% 이상일 때만 트레일링 작동)")
     args = p.parse_args()
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     r = run_dryrun(symbols, args.budget, args.take_profit, args.stop_loss,
                    args.period, args.interval, args.decider, args.lookback,
-                   args.entry_interval, args.max_entry_calls)
+                   args.entry_interval, args.max_entry_calls,
+                   args.trailing, args.trailing_arm)
     _print(r, symbols)
 
 
