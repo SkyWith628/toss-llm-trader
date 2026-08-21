@@ -176,6 +176,35 @@ def test_system_prompt_has_cache_breakpoint():
     assert system[0]["cache_control"] == {"type": "ephemeral"}
 
 
+# --- intraday(장중 진입 타이밍) 모드 ---
+
+def test_intraday_mode_uses_timing_prompt_and_render():
+    """intraday 모드는 타이밍 전용 시스템 프롬프트 + 장중 관점 렌더를 쓴다."""
+    client = _fake_client({"market_view": "대기", "positions": []})
+    strat = LLMAgentStrategy(client=client, mode="intraday")
+    strat.generate_signal(_snapshot())
+    kw = client.messages.calls[0]
+    sys_text = kw["system"][0]["text"]
+    assert "기다릴까" in sys_text and "대기" in sys_text      # 타이밍 프롬프트
+    user_text = kw["messages"][0]["content"]
+    assert "개장가" in user_text and "장중" in user_text       # 장중 렌더
+
+
+def test_intraday_wait_produces_no_entry_weights():
+    """빈 positions(=대기) → 전 종목 목표비중 0 → 오케스트레이터가 진입하지 않는다."""
+    strat = LLMAgentStrategy(
+        client=_fake_client({"market_view": "", "positions": []}), mode="intraday")
+    signals = strat.generate_signal(_snapshot())
+    assert signals and all(s.target_weight == 0 for s in signals)
+
+
+def test_daily_mode_unchanged_by_default():
+    """기본(daily) 모드는 기존 프롬프트를 유지(하위호환)."""
+    client = _fake_client({"market_view": "", "positions": []})
+    LLMAgentStrategy(client=client).generate_signal(_snapshot())
+    assert "포트폴리오 매니저" in client.messages.calls[0]["system"][0]["text"]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

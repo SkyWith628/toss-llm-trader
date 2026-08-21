@@ -12,7 +12,7 @@ import json
 import os
 from typing import Any
 
-from src.config import DEFAULT_BUDGET_USD
+from src.config import DEFAULT_BUDGET_USD, DEFAULT_STOP_LOSS, DEFAULT_TAKE_PROFIT
 from src.core.types import MarketSnapshot, Signal
 from src.strategy.base import Strategy
 from src.strategy.llm_agent.decision_tool import (
@@ -21,7 +21,12 @@ from src.strategy.llm_agent.decision_tool import (
     decision_to_signals,
 )
 from src.strategy.llm_agent.memory import DecisionMemory
-from src.strategy.llm_agent.prompts import build_system_prompt, render_snapshot
+from src.strategy.llm_agent.prompts import (
+    build_system_prompt,
+    build_timing_prompt,
+    render_intraday_snapshot,
+    render_snapshot,
+)
 
 
 class LLMAgentStrategy(Strategy):
@@ -35,15 +40,24 @@ class LLMAgentStrategy(Strategy):
         log_path: str | None = None,
         max_memory: int = 5,
         budget: float = DEFAULT_BUDGET_USD,
+        mode: str = "daily",
+        take_profit: float = DEFAULT_TAKE_PROFIT,
+        stop_loss: float = DEFAULT_STOP_LOSS,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
         self.log_path = log_path
-        self.name = f"llm_agent({model})"
+        self.mode = mode                          # "daily"(개장 배분) | "intraday"(장중 진입 타이밍)
+        self.name = f"llm_agent({model},{mode})"
         self._client = client  # 테스트에서 목(mock) 주입 가능
         self.memory = DecisionMemory(max_memory)  # 직전 결정·회고(연속적 의사결정)
-        # 실제 예산을 주입해 프롬프트를 1회 완성 → LLM이 항상 실제 예산으로 판단한다.
-        self.system_prompt = build_system_prompt(budget)
+        # 모드별 고정부(system) + 관측치 렌더러를 1회 선택 → LLM이 과업에 맞게 판단한다.
+        if mode == "intraday":
+            self.system_prompt = build_timing_prompt(budget, take_profit, stop_loss)
+            self._render = render_intraday_snapshot
+        else:
+            self.system_prompt = build_system_prompt(budget)
+            self._render = render_snapshot
 
     @property
     def client(self) -> Any:
@@ -59,7 +73,7 @@ class LLMAgentStrategy(Strategy):
         date = snapshot.timestamp.date().isoformat()
 
         # 회고(직전 결정+결과)를 오늘 관측치 앞에 붙여 연속적 의사결정으로.
-        user_msg = render_snapshot(snapshot)
+        user_msg = self._render(snapshot)
         retro = self.memory.retrospective(snapshot.prices)
         if retro:
             user_msg = f"{retro}\n\n{user_msg}"
