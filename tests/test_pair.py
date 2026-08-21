@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.types import Action, MarketSnapshot, Signal
+from src.experiment.eval_harness import BASE_DEFAULTS, PRESETS, resolve_config
 from src.risk.day_risk import DayRiskManager, RiskAction
 from src.runtime.pair_decider import PairEntryDecider
 from src.strategy.pair_gate import (
@@ -45,6 +46,23 @@ def test_clamp_thresholds():
     assert clamp_thresholds(0.05, 0.02) == (0.05, -0.02)      # 범위 내 그대로
     assert clamp_thresholds(0.20, 0.10) == (0.08, -0.04)      # 상한 캡
     assert clamp_thresholds(0.005, 0.001) == (0.02, -0.01)    # 하한 바닥
+
+
+# --- 하네스 구성 우선순위(resolve_config) — 순수, 네트워크 0 ---
+
+def test_resolve_config_priority():
+    # 프리셋 없음 → BASE_DEFAULTS 그대로
+    assert resolve_config(None, {"symbols": None}) == BASE_DEFAULTS
+    # 3x 프리셋 → 재보정 임계·슬리피지로 교체
+    c3 = resolve_config("3x", {k: None for k in BASE_DEFAULTS})
+    assert c3["symbols"] == "SOXL,SOXS" and c3["stop_loss"] == -0.02
+    assert c3["slippage"] == 0.001 and c3["take_profit"] == 0.04
+    # 명시 인자(None 아님)는 프리셋보다 우선, None은 무시
+    over = resolve_config("3x", {"stop_loss": -0.03, "take_profit": None})
+    assert over["stop_loss"] == -0.03            # 사용자 값 우선
+    assert over["take_profit"] == PRESETS["3x"]["take_profit"]  # None → 프리셋 유지
+    # 전역 1x 벤치마크는 프리셋 슬리피지 상향에 영향 없음
+    assert resolve_config(None, {})["slippage"] == 0.0005
 
 
 # --- DayRiskManager.set_thresholds ---

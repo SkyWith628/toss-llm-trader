@@ -7,6 +7,9 @@
        '승률'이 아니라 기대값(expectancy=E[r])을 1차 지표로 둔다(고승률≠고수익).
 [How]  결정론적 변형만 → API 비용 0·재현 가능. LLM 진입은 비용 때문에 여기서 제외(별도 dry-run).
        실행: python -m src.experiment.eval_harness --symbols SPY,QQQ,DIA,IWM --period 5d
+       3x 페어: python -m src.experiment.eval_harness --preset 3x --period 5d
+              (SOXL/SOXS를 재보정 임계 +4%/−2%·슬리피지 0.1%로. '딥타이밍' 변형이 결정론적
+               진입 게이트 역할 — 기댓값 게이트의 p는 LLM 전용이라 여기선 딥으로 대리한다.)
 """
 from __future__ import annotations
 
@@ -26,6 +29,35 @@ from src.runtime.state import IntradayState
 
 BUDGET = 1000.0
 _BIG = 10.0  # '사실상 무한' 임계(B&H: 서킷 안 걸리게)
+
+# 구성 우선순위: BASE_DEFAULTS(1x 저변동) ← PRESET(레버리지 등) ← 명시 CLI 인자.
+# 3x는 SOXL/SOXS 1분봉 관찰(docs/design-leveraged-pair.md 부록)로 재보정한 임계·슬리피지.
+BASE_DEFAULTS: dict = dict(
+    symbols="SPY,QQQ,DIA,IWM", take_profit=DEFAULT_TAKE_PROFIT, stop_loss=DEFAULT_STOP_LOSS,
+    trailing=0.005, trailing_arm=0.008, dip=0.003, slippage=0.0005,
+)
+PRESETS: dict[str, dict] = {
+    # 3x 인버스 페어: 손절 −1%는 whipsaw(부록 관찰) → −2%로 넓히고 익절 +4%, 트레일·딥 상향.
+    # 슬리피지는 변동성 반영해 0.1%(전역 0.05%의 2배)로 격리 — 1x 벤치마크엔 영향 없음.
+    "3x": dict(
+        symbols="SOXL,SOXS", take_profit=0.04, stop_loss=-0.02,
+        trailing=0.015, trailing_arm=0.02, dip=0.01, slippage=0.001,
+    ),
+}
+
+
+def resolve_config(preset: str | None, overrides: dict) -> dict:
+    """BASE_DEFAULTS 위에 preset을, 그 위에 명시 인자(None 아님)만 덮어써 최종 구성 반환.
+
+    순수 함수(네트워크·상태 0) — CLI 우선순위 규칙을 단위 테스트로 고정하기 위한 이음매.
+    """
+    cfg = dict(BASE_DEFAULTS)
+    if preset:
+        cfg.update(PRESETS[preset])
+    for key, val in overrides.items():
+        if val is not None:
+            cfg[key] = val
+    return cfg
 
 
 # --- 데이터: 1분봉을 일자별로 그룹 ---
@@ -73,13 +105,14 @@ def _variants(sym: str, tp: float, sl: float, trail: float, arm: float, dip: flo
     ]
 
 
-def _run_day(sym: str, ticks: list[dict], v: dict) -> dict:
+def _run_day(sym: str, ticks: list[dict], v: dict,
+             slippage: float = BASE_DEFAULTS["slippage"]) -> dict:
     """한 종목·하루·한 변형 실행 → {ret, halt_reason, entered}."""
     risk = DayRiskManager(take_profit=v["tp"], stop_loss=v["sl"],
                           trailing=v.get("trail"), trailing_arm=v.get("arm", 0.0))
     orch = Orchestrator(
         symbols=[sym], clock=_AlwaysOpenClock("eval-day"), feed=ReplayFeed(ticks),
-        broker=PaperBroker(starting_cash=BUDGET),
+        broker=PaperBroker(starting_cash=BUDGET, slippage=slippage),
         guardrail=Guardrail(budget=BUDGET, valid_symbols={sym}),
         risk=risk, state=IntradayState.new(BUDGET, [sym]),
         open_decider=v.get("open"), entry_decider=v.get("entry"),
@@ -133,7 +166,8 @@ def _aggregate(rets: list[float], halts: list[str], entered: list[bool]) -> dict
 
 
 def run_eval(symbols: list[str], period: str, interval: str,
-             tp: float, sl: float, trail: float, arm: float, dip: float) -> dict:
+             tp: float, sl: float, trail: float, arm: float, dip: float,
+             slippage: float = 0.0005, preset: str | None = None) -> dict:
     # 변형별 시행 누적
     acc: dict[str, dict] = {}
     trials = 0
@@ -145,24 +179,25 @@ def run_eval(symbols: list[str], period: str, interval: str,
             trials += 1
             for name, v in _variants(sym, tp, sl, trail, arm, dip):
                 a = acc.setdefault(name, {"rets": [], "halts": [], "entered": []})
-                r = _run_day(sym, ticks, v)
+                r = _run_day(sym, ticks, v, slippage)
                 a["rets"].append(r["ret"])
                 a["halts"].append(r["halt_reason"])
                 a["entered"].append(r["entered"])
     results = {name: _aggregate(d["rets"], d["halts"], d["entered"])
                for name, d in acc.items()}
-    return {"trials": trials, "symbols": symbols, "period": period,
-            "thresholds": (tp, sl, trail, arm, dip), "results": results}
+    return {"trials": trials, "symbols": symbols, "period": period, "preset": preset,
+            "thresholds": (tp, sl, trail, arm, dip, slippage), "results": results}
 
 
 def _print(out: dict) -> None:
-    tp, sl, trail, arm, dip = out["thresholds"]
+    tp, sl, trail, arm, dip, slippage = out["thresholds"]
     if out["trials"] == 0:
         print("[오류] 시행 데이터 없음 — 1분봉 가용 기간/종목 확인(yfinance는 최근 며칠만).")
         return
+    tag = f"[{out['preset']} 프리셋] " if out.get("preset") else ""
     print("\n" + "=" * 92)
-    print(f"  평가 하네스 | {','.join(out['symbols'])} | {out['trials']}시행(종목×거래일) "
-          f"| 익절 {tp:+.1%} 손절 {sl:+.1%} 트레일 δ{trail}/arm{arm} 딥{dip}")
+    print(f"  평가 하네스 | {tag}{','.join(out['symbols'])} | {out['trials']}시행(종목×거래일) "
+          f"| 익절 {tp:+.1%} 손절 {sl:+.1%} 트레일 δ{trail}/arm{arm} 딥{dip} 슬립 {slippage:.2%}")
     print("=" * 92)
     hdr = (f"  {'변형':<20} {'승률':>6} {'기대값':>9} {'손익비':>6} "
            f"{'Sharpe':>7} {'복리수익':>9} {'MDD':>8} {'진입율':>6} {'손절/트레일/익절':>14}")
@@ -183,19 +218,29 @@ def _print(out: dict) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="평가 하네스 — 단일 ETF 변형 비교")
-    p.add_argument("--symbols", default="SPY,QQQ,DIA,IWM", help="단일 ETF 목록")
+    # 임계 인자는 default=None: 미지정 시 프리셋(또는 BASE_DEFAULTS)에서 채운다(resolve_config).
+    p.add_argument("--preset", choices=list(PRESETS), default=None,
+                   help="레버리지 프리셋(예: 3x → SOXL/SOXS 재보정 임계·슬리피지). 명시 인자가 우선.")
+    p.add_argument("--symbols", default=None, help="단일 ETF 목록(미지정 시 프리셋 기본)")
     p.add_argument("--period", default="5d", help="yfinance 기간(1분봉은 보통 최근 5~7일)")
     p.add_argument("--interval", default="1m")
-    p.add_argument("--take-profit", type=float, default=DEFAULT_TAKE_PROFIT)
-    p.add_argument("--stop-loss", type=float, default=DEFAULT_STOP_LOSS)
-    p.add_argument("--trailing", type=float, default=0.005, help="트레일링 δ(고점 대비 되돌림)")
-    p.add_argument("--trailing-arm", type=float, default=0.008, help="트레일링 무장 임계 a")
-    p.add_argument("--dip", type=float, default=0.003, help="딥타이밍 진입 트리거(개장가 대비 하락)")
+    p.add_argument("--take-profit", type=float, default=None)
+    p.add_argument("--stop-loss", type=float, default=None)
+    p.add_argument("--trailing", type=float, default=None, help="트레일링 δ(고점 대비 되돌림)")
+    p.add_argument("--trailing-arm", type=float, default=None, help="트레일링 무장 임계 a")
+    p.add_argument("--dip", type=float, default=None, help="딥타이밍 진입 트리거(개장가 대비 하락)")
+    p.add_argument("--slippage", type=float, default=None, help="체결가 밀림(레버리지는 상향 권장)")
     args = p.parse_args()
 
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    out = run_eval(symbols, args.period, args.interval, args.take_profit,
-                   args.stop_loss, args.trailing, args.trailing_arm, args.dip)
+    cfg = resolve_config(args.preset, {
+        "symbols": args.symbols, "take_profit": args.take_profit, "stop_loss": args.stop_loss,
+        "trailing": args.trailing, "trailing_arm": args.trailing_arm, "dip": args.dip,
+        "slippage": args.slippage,
+    })
+    symbols = [s.strip() for s in cfg["symbols"].split(",") if s.strip()]
+    out = run_eval(symbols, args.period, args.interval, cfg["take_profit"],
+                   cfg["stop_loss"], cfg["trailing"], cfg["trailing_arm"], cfg["dip"],
+                   slippage=cfg["slippage"], preset=args.preset)
     _print(out)
 
 
