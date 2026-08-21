@@ -84,5 +84,23 @@ tests/test_meta_orchestrator.py
 - **일별 자본 리밸런싱**: 증분 4는 개장 재슬라이스만. 장중 재분배·복리 정합은 v2.5.
 - **브랜치 병합**: fresh SleeveAccount ↔ main CarveOutBroker 정합은 별도 세션([[project-branch-divergence]]).
 
+## 부록: v2 실측 (2026-08-22, meta_dryrun)
+
+증분 1~4 완료. `python -m src.runtime.meta_dryrun --core-frac 0.6 --pair-frac 0.4 --pair-stop -0.015`
+(2026-08-21 1분봉):
+
+| 슬리브 | 자본$ | 종가$ | 수익 | 서킷 |
+|---|---:|---:|---:|---|
+| core (SPY·QQQ) | 600 | 588.88 | −1.85% | — (생존) |
+| pair (SOXL) | 400 | 362.83 | −9.29% | **stop_loss** |
+
+- **독립 서킷 실증**: 페어(3x)가 손절 청산돼도 **코어는 독립적으로 계속** — v1 공유 서킷이었다면 코어까지
+  함께 청산됐을 것.
+- **관찰**: 페어 청산이 −1.5% 손절선이 아닌 −9.29%에서 — 3x가 **1분봉 하나에서 손절선을 훌쩍 초과**(이산
+  감시 + 레버리지 갭). 버그 아닌 실제 한계(페어 설계 §부록의 "3x 갭 위험"과 일관). 후속: 틱 내 보호는
+  주문형 stop이 필요(페이퍼 한계).
+- **자본 슬라이스**: `slice_capital(budget, sleeves, Allocator)` 로 개장 시 배정. 장중 런타임엔 일별
+  히스토리가 없어 dry-run은 고정 배분 — vol/corr 슬라이스는 일별 평면(main.py --strategy meta)에서 실증됨.
+
 ---
-*권장: 증분 1(process_tick 추출, 무회귀)부터 — 리팩터가 안전해야 나머지가 선다.*
+*권장: 증분 1(process_tick 추출, 무회귀)부터 — 리팩터가 안전해야 나머지가 선다. **v2 증분 1~4 완료.***

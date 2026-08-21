@@ -11,34 +11,29 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.core.types import Action, Signal
-from src.execution.paper_broker import PaperBroker
+from src.core.types import Action, MarketSnapshot, Signal
 from src.market.feed import ReplayFeed
-from src.risk.day_risk import DayRiskManager
-from src.risk.guardrail import Guardrail
+from src.portfolio import FixedAllocator, InverseVolAllocator, Sleeve
 from src.runtime.dryrun import _AlwaysOpenClock
-from src.runtime.meta_orchestrator import MetaOrchestrator
-from src.runtime.orchestrator import Orchestrator
-from src.runtime.sleeve_account import SleeveAccount
-from src.runtime.state import IntradayState
+from src.runtime.meta_orchestrator import MetaOrchestrator, slice_capital
+from src.runtime.sleeve_account import make_sleeve_account
 
 
-def _sleeve(name: str, sym: str, capital: float, stop_loss: float) -> SleeveAccount:
+def _sleeve(name: str, sym: str, capital: float, stop_loss: float):
     """개장 90% 매수 + 지정 손절선을 가진 독립 슬리브(피드는 메타가 소유하므로 None)."""
-    orch = Orchestrator(
-        symbols=[sym], clock=_AlwaysOpenClock("meta-day"), feed=None,
-        broker=PaperBroker(starting_cash=capital),
-        guardrail=Guardrail(budget=capital, valid_symbols={sym}),
-        risk=DayRiskManager(take_profit=10.0, stop_loss=stop_loss),
-        state=IntradayState.new(capital, [sym]),
-        open_decider=lambda px, s=sym: [Signal(s, Action.BUY, 0.9)],
-        state_path=os.path.join(tempfile.mkdtemp(), f"{name}.json"), poll_interval=0.0,
-    )
-    return SleeveAccount(name, orch)
+    return make_sleeve_account(
+        name=name, symbols=[sym], capital=capital, clock=_AlwaysOpenClock("meta-day"),
+        open_decider=lambda px, s=sym: [Signal(s, Action.BUY, 0.9)], stop_loss=stop_loss)
+
+
+class _Stub:
+    """배분 계산용 더미 전략(allocator는 symbols·snapshot만 보고 strategy는 안 부름)."""
+    def generate_signal(self, snapshot):
+        return []
 
 
 def test_one_sleeve_halts_other_survives():
@@ -64,6 +59,40 @@ def test_one_sleeve_halts_other_survives():
     assert abs(out["close_equity"]
                - (out["sleeves"]["core"]["close_equity"]
                   + out["sleeves"]["sat"]["close_equity"])) < 1e-6
+
+
+def test_slice_capital_fixed():
+    # budget 1000, 고정 0.7/0.3 → {core:700, pair:300}
+    sleeves = [Sleeve("core", _Stub(), ["SPY"]), Sleeve("pair", _Stub(), ["SOXL"])]
+    caps = slice_capital(1000.0, sleeves, FixedAllocator({"core": 0.7, "pair": 0.3}))
+    assert caps == {"core": 700.0, "pair": 300.0}
+
+
+def test_slice_capital_inverse_vol_gives_less_to_high_vol():
+    # 일별 히스토리 스냅샷 주입 — 고변동 슬리브가 자본을 적게 받는다.
+    _ts = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    calm = [100, 100.5, 100, 100.5, 100, 100.5, 100, 100.5, 100, 100.5, 100]
+    wild = [100, 105, 100, 105, 100, 105, 100, 105, 100, 105, 100]
+    snap = MarketSnapshot(timestamp=_ts, prices={"CALM": 100, "WILD": 100},
+                          history={"CALM": calm, "WILD": wild})
+    sleeves = [Sleeve("calm", _Stub(), ["CALM"]), Sleeve("wild", _Stub(), ["WILD"])]
+    caps = slice_capital(1000.0, sleeves, InverseVolAllocator(lookback=10), snap)
+    assert abs(sum(caps.values()) - 1000.0) < 1e-6
+    assert caps["calm"] > caps["wild"]          # 저변동에 더 큰 자본 슬라이스
+
+
+def test_sliced_capital_flows_into_sleeve_brokers():
+    # slice_capital → make_sleeve_account 로 만든 슬리브 broker에 실제 반영되는지.
+    sleeves = [Sleeve("core", _Stub(), ["CORE"]), Sleeve("sat", _Stub(), ["SAT"])]
+    caps = slice_capital(1000.0, sleeves, FixedAllocator({"core": 0.6, "sat": 0.4}))
+    core = _sleeve("core", "CORE", caps["core"], -0.10)
+    sat = _sleeve("sat", "SAT", caps["sat"], -0.02)
+    assert core.capital() == 600.0 and sat.capital() == 400.0        # 슬라이스 반영
+    meta = MetaOrchestrator(sleeves=[core, sat], clock=_AlwaysOpenClock("d"),
+                            feed=ReplayFeed([{"CORE": 100.0, "SAT": 100.0}]), poll_interval=0.0)
+    out = meta.run_trading_day()
+    assert abs(out["sleeves"]["core"]["day_start_equity"] - 600.0) < 1e-6
+    assert abs(out["sleeves"]["sat"]["day_start_equity"] - 400.0) < 1e-6
 
 
 def test_meta_orchestrator_validates_construction():

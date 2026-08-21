@@ -12,12 +12,29 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Callable
 
+from src.core.types import MarketSnapshot
 from src.market.feed import FeedExhausted, StaleFeedError
+from src.portfolio.allocator import Allocator
+from src.portfolio.sleeve import Sleeve
 from src.runtime.sleeve_account import SleeveAccount
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def slice_capital(budget: float, sleeves: list[Sleeve], allocator: Allocator,
+                  snapshot: MarketSnapshot | None = None) -> dict[str, float]:
+    """개장 시 자본 슬라이스 — Allocator의 a_i로 {슬리브: budget·a_i} 산출.
+
+    [Why] v2에서 각 슬리브 broker의 시작 자본을 배분 정책이 정한다. vol/corr 배분은 '일별
+          히스토리 스냅샷'이 필요(장중 런타임엔 없으므로 개장 전 store에서 만들어 주입).
+          FixedAllocator는 snapshot을 무시하므로 히스토리 없이도 동작.
+    [How] Σa_i ≤ 1 이라 배정 합 ≤ budget(나머지는 미투입 현금). 슬리브 유니버스는 v1 Sleeve로
+          기술(name·strategy·symbols) — 여기선 배분 계산에만 쓰이고, 실행기는 별도 조립한다.
+    """
+    alloc = allocator.weights(sleeves, snapshot)
+    return {s.name: round(budget * alloc.get(s.name, 0.0), 4) for s in sleeves}
 
 
 class MetaOrchestrator:

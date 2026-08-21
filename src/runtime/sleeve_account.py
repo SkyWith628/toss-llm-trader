@@ -9,9 +9,15 @@
 """
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
 
+from src.execution.paper_broker import PaperBroker
+from src.risk.day_risk import DayRiskManager
+from src.risk.guardrail import Guardrail
 from src.runtime.orchestrator import Orchestrator
+from src.runtime.state import IntradayState
 
 
 @dataclass
@@ -25,3 +31,41 @@ class SleeveAccount:
 
     def start_equity(self) -> float:
         return self.orch.state.day_start_equity
+
+    def capital(self) -> float:
+        return self.orch.broker.get_portfolio().cash
+
+
+def make_sleeve_account(
+    *,
+    name: str,
+    symbols: list[str],
+    capital: float,
+    clock,
+    open_decider=None,
+    entry_decider=None,
+    stop_loss: float,
+    take_profit: float = 10.0,
+    trailing: float | None = None,
+    trailing_arm: float = 0.0,
+    poll_interval: float = 0.0,
+    state_path: str | None = None,
+) -> SleeveAccount:
+    """슬리브 하나를 자본 슬라이스와 함께 조립 — 독립 broker·risk·state를 든 Orchestrator.
+
+    피드는 MetaOrchestrator가 단일 소유하므로 None(begin_trading_day에 개장 시세를 넘겨받는다).
+    open_decider(개장 진입) 또는 entry_decider(장중 타이밍) 중 하나는 필요.
+    """
+    if state_path is None:
+        state_path = os.path.join(tempfile.mkdtemp(), f"{name}.json")
+    orch = Orchestrator(
+        symbols=list(symbols), clock=clock, feed=None,
+        broker=PaperBroker(starting_cash=capital),
+        guardrail=Guardrail(budget=capital, valid_symbols=set(symbols)),
+        risk=DayRiskManager(take_profit=take_profit, stop_loss=stop_loss,
+                            trailing=trailing, trailing_arm=trailing_arm),
+        state=IntradayState.new(capital, list(symbols)),
+        open_decider=open_decider, entry_decider=entry_decider,
+        state_path=state_path, poll_interval=poll_interval,
+    )
+    return SleeveAccount(name, orch)
