@@ -62,6 +62,19 @@ class DayRiskManager:
     def anchored(self) -> bool:
         return self._anchor is not None
 
+    def set_thresholds(self, take_profit: float, stop_loss: float) -> None:
+        """진입 시점에 그 날의 익절·손절 임계를 확정 주입(기댓값 기반 동적 임계).
+
+        [Why] 페어/기댓값 전략은 진입 순간 LLM 목표·손절을 클램프해 임계로 삼는다. 이후
+              서킷브레이커는 '고정된' 이 값으로만 결정론 판정 — 청산은 여전히 코드 몫.
+        """
+        if take_profit <= 0:
+            raise ValueError(f"take_profit은 양수여야 함: {take_profit}")
+        if stop_loss >= 0:
+            raise ValueError(f"stop_loss는 음수여야 함: {stop_loss}")
+        self.take_profit = take_profit
+        self.stop_loss = stop_loss
+
     def daily_return(self, current_equity: float) -> float:
         """앵커 대비 현재 수익률. 앵커 미설정 시 에러(개장 앵커가 선행돼야 함)."""
         if self._anchor is None:

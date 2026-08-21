@@ -81,6 +81,19 @@ def _make_llm_entry_decider(symbols: list[str], budget: float,
     return strategy.generate_signal
 
 
+def _make_pair_decider(symbols: list[str], budget: float, risk):
+    """3x 인버스 페어 진입 어댑터. LLM(mode='pair')이 방향·g·loss를 내면 기댓값 게이트·
+    상호배타를 적용하고 진입 시 risk에 동적 임계를 주입한다(청산은 결정론 유지).
+    """
+    from src.main import load_env_file
+    from src.runtime.pair_decider import PairEntryDecider
+    from src.strategy.llm_agent.agent import LLMAgentStrategy
+
+    load_env_file()
+    strategy = LLMAgentStrategy(budget=budget, log_path="logs/llm_decisions.jsonl", mode="pair")
+    return PairEntryDecider(strategy, risk)
+
+
 def load_intraday_ticks(symbols: list[str], period: str, interval: str):
     """실제 1분봉을 (거래일, [ {sym: close}, ... ]) 로 반환. 모든 종목 존재하는 바만."""
     import yfinance as yf  # 선택 의존성
@@ -111,12 +124,19 @@ def run_dryrun(symbols, budget, take_profit, stop_loss, period, interval,
     if not ticks:
         return {"status": "error", "reason": "1분봉 데이터 없음(장중/직전 세션 확인)"}
 
-    # 진입 방식 3종 — 출구(익절/손절 서킷브레이커)는 모두 동일.
-    #  equal  : 개장 동일비중 90%      (개장 진입 모드)
-    #  llm    : 개장 LLM 전권 비중      (개장 진입 모드)
-    #  timing : 장중 LLM 진입 타이밍    (현금 시작 → 감시 루프가 진입 판단)
+    # 진입 방식 — 출구(서킷브레이커)는 모두 동일.
+    #  equal  : 개장 동일비중 90%          (개장 진입)
+    #  llm    : 개장 LLM 전권 비중          (개장 진입)
+    #  timing : 장중 LLM 진입 타이밍        (현금 시작 → 감시 루프가 진입 판단)
+    #  pair   : 3x 인버스 페어 기댓값 게이트 (장중, 한 방향·동적 임계, risk에 임계 주입)
+    risk = DayRiskManager(take_profit=take_profit, stop_loss=stop_loss,
+                          trailing=trailing, trailing_arm=trailing_arm)
+    slippage = 0.0005
     open_decider = entry_decider = None
-    if decider == "timing":
+    if decider == "pair":
+        entry_decider = _make_pair_decider(symbols, budget, risk)
+        slippage = 0.001                       # 3x 레버리지 ETF는 스프레드 여유 있게
+    elif decider == "timing":
         entry_decider = _make_llm_entry_decider(symbols, budget, take_profit, stop_loss)
     elif decider == "llm":
         open_decider = _make_llm_decider(symbols, budget, lookback)
@@ -128,10 +148,9 @@ def run_dryrun(symbols, budget, take_profit, stop_loss, period, interval,
         symbols=symbols,
         clock=_AlwaysOpenClock(date),
         feed=ReplayFeed(ticks),
-        broker=PaperBroker(starting_cash=budget),
+        broker=PaperBroker(starting_cash=budget, slippage=slippage),
         guardrail=Guardrail(budget=budget, valid_symbols=set(symbols)),
-        risk=DayRiskManager(take_profit=take_profit, stop_loss=stop_loss,
-                            trailing=trailing, trailing_arm=trailing_arm),
+        risk=risk,
         state=IntradayState.new(budget, symbols),
         open_decider=open_decider,
         entry_decider=entry_decider,
@@ -143,7 +162,8 @@ def run_dryrun(symbols, budget, take_profit, stop_loss, period, interval,
     result = orch.run_trading_day()
     result["status"] = "ok"
     result["total_ticks"] = len(ticks)
-    result["thresholds"] = (take_profit, stop_loss)
+    # 페어는 진입 시 임계가 동적으로 확정되므로 실행 후 risk의 실제 값을 보고.
+    result["thresholds"] = (risk.take_profit, risk.stop_loss)
     result["decider"] = decider
     return result
 
@@ -154,7 +174,8 @@ def _print(r: dict, symbols: list[str]) -> None:
         return
     tp, sl = r["thresholds"]
     mode = r.get("decider")
-    labels = {"llm": "개장 LLM 전권", "timing": "장중 LLM 진입 타이밍", "equal": "개장 동일비중 90%"}
+    labels = {"llm": "개장 LLM 전권", "timing": "장중 LLM 진입 타이밍",
+              "equal": "개장 동일비중 90%", "pair": "3x 인버스 페어(기댓값 게이트)"}
     print("\n" + "=" * 56)
     print(f"  실데이터 dry-run(페이퍼·실주문 0) | {r['date']} | {','.join(symbols)}")
     print("=" * 56)
@@ -185,9 +206,10 @@ def main() -> None:
     p.add_argument("--stop-loss", type=float, default=DEFAULT_STOP_LOSS)
     p.add_argument("--period", default="1d", help="yfinance 기간(예: 1d, 5d)")
     p.add_argument("--interval", default="1m", help="봉 간격(예: 1m, 2m, 5m)")
-    p.add_argument("--decider", choices=("equal", "llm", "timing"), default="equal",
+    p.add_argument("--decider", choices=("equal", "llm", "timing", "pair"), default="equal",
                    help="진입 방식: equal(개장 동일비중) | llm(개장 Claude 전권) | "
-                        "timing(장중 Claude 진입 타이밍) — llm·timing은 .env 키 필요")
+                        "timing(장중 Claude 진입 타이밍) | pair(3x 인버스 페어 기댓값 게이트) "
+                        "— llm·timing·pair는 .env 키 필요")
     p.add_argument("--lookback", type=int, default=60,
                    help="llm decider가 참고할 일봉 history 길이")
     p.add_argument("--entry-interval", type=int, default=5,
