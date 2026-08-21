@@ -11,6 +11,7 @@ from src.portfolio.allocator import (
     Allocator,
     FixedAllocator,
     InverseVolAllocator,
+    RiskParityAllocator,
 )
 from src.portfolio.meta import MetaPortfolioStrategy
 from src.portfolio.sleeve import Sleeve
@@ -20,5 +21,6 @@ __all__ = [
     "Allocator",
     "FixedAllocator",
     "InverseVolAllocator",
+    "RiskParityAllocator",
     "MetaPortfolioStrategy",
 ]

@@ -119,7 +119,11 @@ src/execution/sleeve_broker.py      # 또는 main 브랜치 CarveOutBroker 이�
 - **`allocator.py`** — `Allocator.weights(sleeves, history) -> {name: a_i}` (Σa_i ≤ 1). 순수 함수 계열.
   - `FixedAllocator({name: a})`: 고정 비중(예 코어 0.5·페어 0.2·유니버스 0.3).
   - `InverseVolAllocator(lookback)`: 최근 수익률 표준편차로 `a_i ∝ 1/σ_i` 후 정규화.
-  - `RiskParityAllocator(lookback)`: 공분산 기반 등리스크(초기엔 역변동성 근사로 시작).
+  - `RiskParityAllocator(lookback)`: 등리스크기여(ERC) — 각 슬리브의 리스크 기여를 균등하게.
+    `Σ = D·Corr·D` (대각 σ는 종목 σ 평균=invvol 일관, 상관은 대리수익률에서) 후 곱셈 반복해로
+    ERC 가중을 푼다. **주의**: 인버스 페어(SOXL/SOXS)는 동일가중이 상쇄돼 대리 분산이 ~0 →
+    상관을 0(무상관)으로 가드하고, 대각 σ를 종목별 σ 평균으로 잡아 '한 레그 보유'의 실제 고변동을
+    반영(그렇지 않으면 페어를 저위험으로 오판해 과배분 — 실측에서 61%까지 튐, 부록 C).
   - `PerfMomentumAllocator(lookback)`: 최근 성과 좋은 슬리브 가중(과최적화 주의 — 후순위).
 - **`meta.py`** — `MetaPortfolioStrategy(sleeves, allocator)`:
   1. 각 `sleeve.strategy.generate_signal(snapshot)` 호출 → 슬리브별 `{sym: w}`.
@@ -193,6 +197,24 @@ src/execution/sleeve_broker.py      # 또는 main 브랜치 CarveOutBroker 이�
 - **주의**: 이 B&H 벤치마크(−50.9% MDD)는 SOXL+SOXS **동시보유**로 decay 자멸 → 여기선 허수아비. n=1 창·
   상승 레짐·결정론 페어라 **결론 아닌 방향 신호**.
 
+## 부록 C: v1.5 리스크패리티 실측 (2026-08-22, 3슬리브)
+
+**core-mom-pair 라인업**(코어 B&H[SPY·QQQ·AAPL·MSFT] + 모멘텀 + 3x 페어[SOXL/SOXS]), 실데이터 120일
+
+| 배분 | 페어 aᵢ | 누적수익 | Sharpe | Sortino | MDD | Calmar |
+|---|---:|---:|---:|---:|---:|---:|
+| invvol | 0.089 | 21.4% | 3.00 | 5.20 | −6.7% | 7.50 |
+| **riskparity** | 0.058 | **24.3%** | **3.33** | **5.96** | **−4.7%** | **12.46** |
+
+- **리스크패리티가 모든 위험조정 지표에서 invvol 우위** — 코어·모멘텀이 같은 주식 클러스터(상관 높음)
+  임을 인식해 중복 리스크를 줄이고, 무상관 페어와 균형 → 더 얕은 낙폭. **2슬리브에선 invvol과 동일**하던
+  게 3슬리브에선 갈라짐 = 상관 반영의 가치(결정 2).
+- **발견·수정한 버그**: 초기 구현은 슬리브 공분산을 '종목 동일가중 대리수익률'로 추정 → 인버스 페어
+  (SOXL/SOXS)가 상쇄돼 저위험으로 오판, 리스크패리티가 페어에 **61%** 과배분(→ 3x가 터져 수익 202%·
+  MDD −21%의 허위 신호). 수정: 대각 σ를 종목 σ 평균(invvol 일관)으로, 상관만 대리수익률에서. 교훈:
+  **전략이 종목을 동일보유하지 않으면(페어=한 레그, 모멘텀=top-k) 동일가중 대리수익률은 리스크를
+  오모델링**한다. 슬리브 실제 보유 기반 추정이 v2 과제.
+
 ---
-*권장 실행 순서: v1(고정배분 Composite) 구현 → 비교군 4종 측정 → 역변동성 추가 → (근거 시) v2 서브계좌.*
+*권장 실행 순서: v1(고정배분) → 비교군 측정 → v1.5(역변동성·리스크패리티) → (근거 시) v2 서브계좌.*
 *관련: [[design-leveraged-pair]](페어 슬리브 = 위성), 브랜치 통합(카브아웃 base) = v2 접점.*

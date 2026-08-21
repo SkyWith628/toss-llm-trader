@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.types import Action, MarketSnapshot, Signal
 from src.portfolio import (
-    FixedAllocator, InverseVolAllocator, MetaPortfolioStrategy, Sleeve,
+    FixedAllocator, InverseVolAllocator, MetaPortfolioStrategy,
+    RiskParityAllocator, Sleeve,
 )
 from src.strategy.pair_trend import PairTrendStrategy
 from src.strategy.rule_based import BuyAndHoldStrategy
@@ -77,6 +78,56 @@ def test_inverse_vol_falls_back_to_equal_when_no_history():
     sleeves = [Sleeve("a", _FixedSignals({}), ["X"]),
                Sleeve("b", _FixedSignals({}), ["Y"])]
     a = InverseVolAllocator().weights(sleeves, _snap({"X": 1, "Y": 1}))  # history 없음
+    assert a == {"a": 0.5, "b": 0.5}
+
+
+# --- RiskParityAllocator ---
+
+def _closes(returns: list[float], start: float = 100.0) -> list[float]:
+    """일수익률 리스트 → 종가 리스트(누적곱)."""
+    px = [start]
+    for r in returns:
+        px.append(px[-1] * (1 + r))
+    return px
+
+
+def test_risk_parity_equals_inverse_vol_for_two_sleeves():
+    # 2슬리브(단일종목)에선 리스크패리티 = 역변동성(상관 무관, 이론적 항등식).
+    calm = _closes([0.005, -0.005] * 6)       # 저변동
+    wild = _closes([0.03, -0.03] * 6)         # 고변동
+    snap = _snap({"A": calm[-1], "B": wild[-1]}, history={"A": calm, "B": wild})
+    sleeves = [Sleeve("a", _FixedSignals({}), ["A"]),
+               Sleeve("b", _FixedSignals({}), ["B"])]
+    rp = RiskParityAllocator(lookback=10).weights(sleeves, snap)
+    iv = InverseVolAllocator(lookback=10).weights(sleeves, snap)
+    assert abs(rp["a"] - iv["a"]) < 5e-3      # 동일해야
+    assert rp["a"] > rp["b"]                   # 저변동에 더
+
+
+def test_risk_parity_downweights_correlated_cluster():
+    # 3슬리브: S1=S2(상관 1) · S3 직교, 셋 다 동일 변동성.
+    # 역변동성은 1/3씩, 리스크패리티는 상관 묶음(S1,S2)을 눌러 S3에 더 준다.
+    r1 = [0.01, -0.01] * 4
+    r3 = [0.01, 0.01, -0.01, -0.01] * 2       # 같은 크기, S1과 직교
+    c1, c2, c3 = _closes(r1), _closes(r1), _closes(r3)
+    snap = _snap({"S1": c1[-1], "S2": c2[-1], "S3": c3[-1]},
+                 history={"S1": c1, "S2": c2, "S3": c3})
+    sleeves = [Sleeve("s1", _FixedSignals({}), ["S1"]),
+               Sleeve("s2", _FixedSignals({}), ["S2"]),
+               Sleeve("s3", _FixedSignals({}), ["S3"])]
+    rp = RiskParityAllocator(lookback=8).weights(sleeves, snap)
+    iv = InverseVolAllocator(lookback=8).weights(sleeves, snap)
+    assert abs(sum(rp.values()) - 1.0) < 1e-6
+    assert abs(iv["s1"] - 1 / 3) < 1e-6 and abs(iv["s3"] - 1 / 3) < 1e-6   # invvol 균등
+    assert rp["s3"] > rp["s1"]                  # 리스크패리티: 직교 슬리브에 더
+    assert abs(rp["s1"] - rp["s2"]) < 1e-3      # 대칭(S1≈S2)
+    assert rp["s3"] > 1 / 3 > rp["s1"]          # invvol과 명확히 갈라짐
+
+
+def test_risk_parity_falls_back_without_history():
+    sleeves = [Sleeve("a", _FixedSignals({}), ["X"]),
+               Sleeve("b", _FixedSignals({}), ["Y"])]
+    a = RiskParityAllocator().weights(sleeves, _snap({"X": 1, "Y": 1}))   # history 없음
     assert a == {"a": 0.5, "b": 0.5}
 
 
