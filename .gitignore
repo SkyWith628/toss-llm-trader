@@ -1,8 +1,9 @@
 .env
+# OneDrive 동기화 충돌 복사본 (PC↔맥북) — 비밀키 노출·중복 방지
+*skywith*
 __pycache__/
 *.pyc
-logs/*.jsonl
-logs/forward/
+logs/
 .venv/
 venv/
 .DS_Store

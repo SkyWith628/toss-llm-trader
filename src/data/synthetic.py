@@ -76,14 +76,17 @@ def make_yfinance_store(
         ) from exc
 
     store = PriceStore(symbols)
+    # threads=False: 스레드 다운로더가 tz 캐시(SQLite)를 동시에 써서 'database is locked'가
+    # 나는 것을 방지. 소수 종목이라 순차 다운로드 비용은 무시할 수준.
     data = yf.download(symbols, period=period, interval=interval,
-                       auto_adjust=True, progress=False)
+                       auto_adjust=True, progress=False, threads=False)
     closes = data["Close"]
     for ts, row in closes.iterrows():
         date = ts.to_pydatetime()
         prices = {}
         for s in symbols:
-            val = row[s] if len(symbols) > 1 else row
+            # 종목수와 무관하게 종목 컬럼으로 안전 추출(단일=Series 특수처리 버그 제거).
+            val = row[s] if s in row.index else float("nan")
             if val == val:  # NaN 체크
                 prices[s] = float(round(val, 4))
         if len(prices) == len(symbols):

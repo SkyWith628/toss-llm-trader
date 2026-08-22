@@ -1,7 +1,7 @@
 """모의(페이퍼) 브로커 — 돈 안 잃고 파이프라인·전략을 검증.
 
 [What] 메모리상의 현금·보유로 시장가 체결을 시뮬레이션(수수료·슬리피지·소수점 반영).
-[Why]  $100 실험의 최대 적은 '비용'이므로, 비용을 처음부터 현실적으로 넣어야
+[Why]  소액 실험의 최대 적은 '비용'이므로, 비용을 처음부터 현실적으로 넣어야
        '종이수익'이 아닌 '실수익'을 측정한다.
 [How]  실거래 TossBroker와 동일한 BrokerClient 계약 → 검증된 코드가 그대로 실거래로.
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from src.config import DEFAULT_BUDGET_USD
 from src.core.types import (Order, OrderResult, Portfolio, Position, Side)
 from src.execution.broker_base import BrokerClient
 
@@ -16,13 +17,14 @@ from src.execution.broker_base import BrokerClient
 class PaperBroker(BrokerClient):
     def __init__(
         self,
-        starting_cash: float = 100.0,
+        starting_cash: float = DEFAULT_BUDGET_USD,
         commission_per_trade: float = 0.0,   # 미국 주식은 대개 건당 0, 스프레드가 실비용
         commission_rate: float = 0.0,        # 거래대금 비례 수수료(예: 0.0005)
         slippage: float = 0.0005,            # 체결가 밀림(0.05%)
         min_notional: float = 1.0,           # 이보다 작은 주문은 무시(먼지 거래 방지)
+        portfolio: Portfolio | None = None,  # 기존 상태 복원용(포워드 테스트). None이면 새로 시작.
     ) -> None:
-        self.portfolio = Portfolio(cash=starting_cash)
+        self.portfolio = portfolio if portfolio is not None else Portfolio(cash=starting_cash)
         self.commission_per_trade = commission_per_trade
         self.commission_rate = commission_rate
         self.slippage = slippage

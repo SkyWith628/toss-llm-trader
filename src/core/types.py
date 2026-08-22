@@ -53,7 +53,7 @@ class Order:
     """집행 계층으로 넘어가는 구체 주문."""
     symbol: str
     side: Side
-    quantity: float        # 소수점 주식 허용($100 실험에 필수)
+    quantity: float        # 소수점 주식 허용(소액 예산 실험에 필수)
     reason: str = ""
 
 

@@ -12,6 +12,7 @@ import json
 import os
 from typing import Any
 
+from src.config import DEFAULT_BUDGET_USD, DEFAULT_STOP_LOSS, DEFAULT_TAKE_PROFIT
 from src.core.types import MarketSnapshot, Signal
 from src.strategy.base import Strategy
 from src.strategy.llm_agent.decision_tool import (
@@ -20,7 +21,13 @@ from src.strategy.llm_agent.decision_tool import (
     decision_to_signals,
 )
 from src.strategy.llm_agent.memory import DecisionMemory
-from src.strategy.llm_agent.prompts import SYSTEM_PROMPT, render_snapshot
+from src.strategy.llm_agent.prompts import (
+    build_pair_prompt,
+    build_system_prompt,
+    build_timing_prompt,
+    render_intraday_snapshot,
+    render_snapshot,
+)
 
 
 class LLMAgentStrategy(Strategy):
@@ -33,13 +40,29 @@ class LLMAgentStrategy(Strategy):
         client: Any | None = None,
         log_path: str | None = None,
         max_memory: int = 5,
+        budget: float = DEFAULT_BUDGET_USD,
+        mode: str = "daily",
+        take_profit: float = DEFAULT_TAKE_PROFIT,
+        stop_loss: float = DEFAULT_STOP_LOSS,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
         self.log_path = log_path
-        self.name = f"llm_agent({model})"
+        self.mode = mode                          # "daily"(개장 배분) | "intraday"(장중 진입 타이밍)
+        self.name = f"llm_agent({model},{mode})"
         self._client = client  # 테스트에서 목(mock) 주입 가능
         self.memory = DecisionMemory(max_memory)  # 직전 결정·회고(연속적 의사결정)
+        self.last_decision: dict | None = None    # 직전 결정 원본(페어 기댓값 게이트가 읽음)
+        # 모드별 고정부(system) + 관측치 렌더러를 1회 선택 → LLM이 과업에 맞게 판단한다.
+        if mode == "intraday":
+            self.system_prompt = build_timing_prompt(budget, take_profit, stop_loss)
+            self._render = render_intraday_snapshot
+        elif mode == "pair":
+            self.system_prompt = build_pair_prompt(budget)
+            self._render = render_intraday_snapshot
+        else:
+            self.system_prompt = build_system_prompt(budget)
+            self._render = render_snapshot
 
     @property
     def client(self) -> Any:
@@ -53,9 +76,10 @@ class LLMAgentStrategy(Strategy):
     def generate_signal(self, snapshot: MarketSnapshot) -> list[Signal]:
         universe = sorted(snapshot.prices)
         date = snapshot.timestamp.date().isoformat()
+        self.last_decision = None      # 이번 호출 결정 초기화(페어 게이트가 뒤에서 읽음)
 
         # 회고(직전 결정+결과)를 오늘 관측치 앞에 붙여 연속적 의사결정으로.
-        user_msg = render_snapshot(snapshot)
+        user_msg = self._render(snapshot)
         retro = self.memory.retrospective(snapshot.prices)
         if retro:
             user_msg = f"{retro}\n\n{user_msg}"
@@ -68,7 +92,7 @@ class LLMAgentStrategy(Strategy):
                 # 통째로 캐시된다. 매일 바뀌는 user 메시지는 캐시 밖(의도된 분리).
                 system=[{
                     "type": "text",
-                    "text": SYSTEM_PROMPT,
+                    "text": self.system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }],
                 messages=[{"role": "user", "content": user_msg}],
@@ -85,6 +109,7 @@ class LLMAgentStrategy(Strategy):
             self._log({"date": date, "error": "submit_decision 툴 호출 없음"})
             return []
 
+        self.last_decision = decision   # 페어 게이트가 target_return/stop_loss/confidence를 읽음
         signals = decision_to_signals(decision, universe, snapshot.timestamp)
         # 실제 결정(>0 비중)을 메모리에 남겨 다음 날 회고 재료로.
         self.memory.record(

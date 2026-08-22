@@ -30,6 +30,14 @@ DECISION_TOOL: dict = {
                 "type": "string",
                 "description": "오늘 시장·종목에 대한 한두 문장 판단 요약(실험 분석용 근거).",
             },
+            "target_return": {
+                "type": "number",
+                "description": "(선택) 진입 시 당일 목표 수익률 g(예 0.04=+4%). 익절 임계 후보로 쓰인다.",
+            },
+            "stop_loss": {
+                "type": "number",
+                "description": "(선택) 허용 손절 폭 loss(양수, 예 0.02=-2%). 손절 임계 후보로 쓰인다.",
+            },
             "positions": {
                 "type": "array",
                 "description": "보유 목표 종목 목록. 비우면 전량 현금.",
@@ -67,6 +75,28 @@ def _as_float(value, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def decision_thresholds(
+    decision: dict, signals: list[Signal]
+) -> tuple[float, float | None, float | None]:
+    """결정에서 기댓값 재료 (p, g, loss)를 뽑는다. 페어/기댓값 게이트가 쓴다.
+
+    - p   = 진입 대상(비중>0) 중 최대 비중 종목의 확신도(없으면 0.5).
+    - g   = target_return(없으면 None → 어댑터가 기본값 사용).
+    - loss= |stop_loss|(없으면 None). 부호 무관하게 크기로 반환.
+    """
+    entered = [s for s in signals if s.target_weight > 0]
+    if entered:
+        top = max(entered, key=lambda s: s.target_weight)
+        p = top.confidence
+    else:
+        p = 0.5
+    g = decision.get("target_return")
+    loss = decision.get("stop_loss")
+    g = _as_float(g, None) if g is not None else None
+    loss = abs(_as_float(loss, 0.0)) if loss is not None else None
+    return p, g, loss
 
 
 def decision_to_signals(

@@ -6,13 +6,14 @@
 """
 from __future__ import annotations
 
+from src.config import DEFAULT_BUDGET_USD
 from src.data.storage import PriceStore
 
 
 def buy_and_hold_equity(
     store: PriceStore,
     symbols: list[str],
-    budget: float = 100.0,
+    budget: float = DEFAULT_BUDGET_USD,
     slippage: float = 0.0005,
     dates: list | None = None,
 ) -> list[float]:

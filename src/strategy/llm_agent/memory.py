@@ -51,11 +51,25 @@ class DecisionMemory:
         ]
 
     def load(self, items: list[dict]) -> None:
-        """to_list()로 저장한 항목을 되살린다(오래된→최신 순 가정, maxlen 자동 유지)."""
+        """to_list()로 저장한 항목을 되살린다(오래된→최신 순 가정, maxlen 자동 유지).
+
+        기존 인스턴스에 이어붙인다(forward runner가 프로세스 간 회고를 실어 나를 때).
+        """
         for it in items:
             self._entries.append(MemoryEntry(
                 it["date"], it.get("market_view", ""),
                 dict(it.get("weights", {})), dict(it.get("prices", {}))))
+
+    @classmethod
+    def from_list(cls, items: list[dict], max_entries: int = 5) -> "DecisionMemory":
+        """직렬화된 기억을 새 인스턴스로 복원. 시간순 record로 링버퍼 규칙(maxlen)을 태운다."""
+        mem = cls(max_entries)
+        for it in items:
+            mem.record(
+                it.get("date", ""), it.get("market_view", ""),
+                dict(it.get("weights", {})), dict(it.get("prices", {})),
+            )
+        return mem
 
     def retrospective(self, current_prices: dict[str, float]) -> str:
         """가장 최근 결정 대비 지금까지의 결과를 회고 텍스트로. 없으면 빈 문자열."""

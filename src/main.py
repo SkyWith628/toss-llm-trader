@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 
+from src.config import DEFAULT_BUDGET_USD
 from src.core.clock import BacktestClock
 from src.data.synthetic import make_synthetic_store, make_yfinance_store
 from src.execution.paper_broker import PaperBroker
@@ -54,14 +55,19 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LLM 자율매매 실험 — 단계 0 파이프라인")
     p.add_argument("--symbols", default="AAA,BBB,CCC,DDD",
                    help="쉼표구분. yfinance면 실티커(예: AAPL,MSFT,NVDA)")
-    p.add_argument("--budget", type=float, default=100.0)
+    p.add_argument("--budget", type=float, default=DEFAULT_BUDGET_USD)
     p.add_argument("--days", type=int, default=180)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--source", choices=["synthetic", "yfinance"], default="synthetic")
     p.add_argument("--lookback", type=int, default=20)
     p.add_argument("--top-k", type=int, default=2)
-    p.add_argument("--strategy", choices=["momentum", "llm"], default="momentum",
-                   help="momentum(규칙 베이스라인) | llm(Claude 자율매매)")
+    p.add_argument("--strategy", choices=["momentum", "llm", "meta"], default="momentum",
+                   help="momentum(규칙 베이스라인) | llm(Claude 자율매매) | meta(전략 배분)")
+    p.add_argument("--allocator", choices=["fixed", "invvol", "riskparity"], default="fixed",
+                   help="--strategy meta 배분: fixed | invvol(역변동성) | riskparity(등리스크기여)")
+    p.add_argument("--meta-lineup", choices=["equity", "core-pair", "core-mom-pair"],
+                   default="equity",
+                   help="meta 슬리브 구성: equity | core-pair(3x위성) | core-mom-pair(3슬리브)")
     p.add_argument("--model", default="claude-opus-5",
                    help="--strategy llm 일 때 사용할 Claude 모델")
     return p.parse_args()
@@ -71,9 +77,64 @@ def build_strategy(args: argparse.Namespace):
     """전략 조립 — 여기만 갈아끼우면 동일 백테스트 환경에서 공정 비교가 된다."""
     if args.strategy == "llm":
         from src.strategy.llm_agent import LLMAgentStrategy  # 선택 의존성(anthropic)
-        return LLMAgentStrategy(model=args.model,
+        return LLMAgentStrategy(model=args.model, budget=args.budget,
                                 log_path=os.path.abspath(LLM_LOG_PATH))
+    if args.strategy == "meta":
+        return build_meta_strategy(args)
     return MomentumStrategy(lookback=args.lookback, top_k=args.top_k)
+
+
+_PAIR_LEGS = ("SOXL", "SOXS")   # core-pair 라인업의 3x 인버스 위성 레그
+
+
+def build_meta_strategy(args: argparse.Namespace):
+    """메타-포트폴리오(전략 배분) 조립. 배분 정책(--allocator)·슬리브 구성(--meta-lineup) 교체.
+
+    - equity   : 코어(B&H) + 모멘텀 — 동질 슬리브(fixed≈invvol).
+    - core-pair: 코어(B&H, 주식) + 페어(3x 추세, SOXL/SOXS) — 이질 슬리브. 역변동성이 고변동
+                 페어에 자본을 적게 주는지 시험(invvol의 존재 이유).
+    설계: docs/design-meta-portfolio.md
+    """
+    from src.portfolio import (
+        FixedAllocator, InverseVolAllocator, MetaPortfolioStrategy,
+        RiskParityAllocator, Sleeve,
+    )
+    from src.strategy.pair_trend import PairTrendStrategy
+    from src.strategy.rule_based import BuyAndHoldStrategy
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    if args.meta_lineup in ("core-pair", "core-mom-pair"):
+        legs = [s for s in _PAIR_LEGS if s in symbols]
+        core_syms = [s for s in symbols if s not in legs]
+        if len(legs) != 2 or not core_syms:
+            raise SystemExit(
+                f"--meta-lineup {args.meta_lineup} 는 코어 주식 + {_PAIR_LEGS} 두 레그가 모두 필요합니다. "
+                f"예: --symbols SPY,QQQ,{_PAIR_LEGS[0]},{_PAIR_LEGS[1]}")
+        pair = Sleeve("pair", PairTrendStrategy(legs, lookback=args.lookback), legs)
+        core = Sleeve("core", BuyAndHoldStrategy(), core_syms)
+        if args.meta_lineup == "core-mom-pair":     # 3슬리브 — 리스크패리티 시험대
+            mom = Sleeve("momentum",
+                         MomentumStrategy(lookback=args.lookback, top_k=args.top_k), core_syms)
+            sleeves = [core, mom, pair]
+            default_fixed = {"core": 0.5, "momentum": 0.2, "pair": 0.3}
+        else:                                       # core-pair — 2슬리브
+            sleeves = [core, pair]
+            default_fixed = {"core": 0.7, "pair": 0.3}   # 위성은 소액(고변동)
+    else:  # equity
+        sleeves = [
+            Sleeve("core", BuyAndHoldStrategy(), symbols),
+            Sleeve("momentum", MomentumStrategy(lookback=args.lookback, top_k=args.top_k), symbols),
+        ]
+        default_fixed = {"core": 0.5, "momentum": 0.5}
+
+    if args.allocator == "invvol":
+        allocator = InverseVolAllocator(lookback=args.lookback)
+    elif args.allocator == "riskparity":
+        allocator = RiskParityAllocator(lookback=args.lookback)
+    else:
+        allocator = FixedAllocator(default_fixed)
+    return MetaPortfolioStrategy(sleeves, allocator)
 
 
 def run(args: argparse.Namespace) -> dict:
