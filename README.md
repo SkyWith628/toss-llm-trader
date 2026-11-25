@@ -31,6 +31,8 @@
 | MDD | -24.75% | -8.97% |
 | 최종 자산 | $833 | $1,097 |
 
+![모멘텀 규칙 vs Buy&Hold 자산 곡선](docs/images/backtest-momentum-vs-bh.png)
+
 규칙 전략이 Buy&Hold를 못 이기는 건 정상입니다. 대부분의 전략이 그렇고, 이 하네스가 전략을 봐주지 않는다는 뜻이기도 합니다. LLM 전략은 같은 환경에서 Forward 페이퍼 테스트로 거래일마다 누적 측정하는 중입니다.
 
 > 재현: `python3 -m src.main --days 250 --seed 7` (외부 의존성 없음)
